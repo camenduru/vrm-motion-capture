@@ -82,6 +82,14 @@ RUN python3.12 -m venv /opt/musetalk \
          soundfile imageio imageio-ffmpeg ffmpeg-python \
          opencv-python-headless mediapipe huggingface_hub
 
+# mediapipe loads EGL/GLES at runtime (the face landmarker); the CUDA runtime
+# base image does not ship them. Kept as its own late layer so the heavy
+# venv layers above stay cached when this changes.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         libegl1 libgles2 libgbm1 libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # ---- wiring + baked-in checks --------------------------------------------
 RUN printf '%s\n' /opt/musetalk/bin/python > /app/MuseTalk/.musetalk_python \
     && mkdir -p /app/animations /app/.cache/lipsync
@@ -98,21 +106,32 @@ RUN test -f /app/models/yolox_x_humanart.onnx \
     && test -f /app/web/dist/index.html \
     && echo "all models and assets baked in"
 
-# import checks: GPU provider visible, app modules load, rtmlib importable
+# import checks: GPU provider visible, app modules load, mediapipe can open
+# the baked face model (this is what needs EGL/GLES in the image)
 RUN /opt/app/bin/python - <<'PY'
 import onnxruntime as ort
 providers = ort.get_available_providers()
 assert 'CUDAExecutionProvider' in providers, providers
-import app.server          # noqa: F401  (fastapi, cv2, rtmlib, mediapipe)
+import app.server          # noqa: F401  (fastapi, cv2, rtmlib)
 import app.offline         # noqa: F401
-import app.lipsync         # noqa: F401
-print('app env ok, providers:', providers)
+from app.face_engine import FaceEngine
+face = FaceEngine()
+assert face.open(), face.error      # mediapipe + face_landmarker.task
+face.close()
+print('app env ok, providers:', providers, '| face model ok')
 PY
 
 RUN /opt/musetalk/bin/python - <<'PY'
 import torch, transformers, diffusers, mediapipe  # noqa: F401
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
+opts = vision.FaceLandmarkerOptions(
+    base_options=mp_python.BaseOptions(
+        model_asset_path='/app/models/face_landmarker.task'),
+    running_mode=vision.RunningMode.IMAGE)
+vision.FaceLandmarker.create_from_options(opts).close()
 print('musetalk env ok, torch', torch.__version__,
-      'cuda available:', torch.cuda.is_available())
+      '| mediapipe landmarker ok')
 PY
 
 EXPOSE 8000
