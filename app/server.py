@@ -62,8 +62,10 @@ def create_app(pose_engine: PoseEngine) -> FastAPI:
     async def revalidate_avatar_assets(request, call_next):
         """Avatar files get swapped in place, so never serve them stale."""
         response = await call_next(request)
-        if request.url.path.startswith('/vrm/'):
-            response.headers['Cache-Control'] = 'no-cache'
+        path = request.url.path
+        if path.startswith('/vrm/') or path == '/' or path.endswith('.html'):
+            # the page must always pull the current bundle after a rebuild
+            response.headers['Cache-Control'] = 'no-store'
         return response
 
     @app.get('/api/status')

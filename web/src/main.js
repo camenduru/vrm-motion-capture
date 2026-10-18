@@ -36,7 +36,6 @@ const loaderText = document.getElementById('loader-text');
 const loaderBar = document.getElementById('loader-bar');
 const statusPill = document.getElementById('status-pill');
 const statusText = document.getElementById('status-text');
-const feedPanel = document.getElementById('feed-panel');
 const feedImg = document.getElementById('feed');
 const feedMeta = document.getElementById('feed-meta');
 const statRender = document.getElementById('stat-render');
@@ -44,7 +43,6 @@ const statPose = document.getElementById('stat-pose');
 const statModel = document.getElementById('stat-model');
 const toastEl = document.getElementById('toast');
 const btnReset = document.getElementById('btn-reset');
-const btnFeed = document.getElementById('btn-feed');
 const btnFull = document.getElementById('btn-fullscreen');
 const btnSound = document.getElementById('btn-sound');
 const sourceAudio = document.getElementById('source-audio');
@@ -266,9 +264,8 @@ const state = {
   wsOpen: false,
   engineError: '',
   toastError: false,
-  feedOn: true,
   audioUrl: '',
-  soundOn: true,
+  soundOn: localStorage.getItem('mocap.sound') !== 'off',
   recording: null,
   animation: null,
   animStart: 0,
@@ -772,25 +769,13 @@ function startFeed() {
 feedImg.addEventListener('load', () => feedImg.classList.add('live'));
 feedImg.addEventListener('error', () => {
   feedImg.classList.remove('live');
-  if (state.feedOn) window.setTimeout(startFeed, 2500);
+  window.setTimeout(startFeed, 2500);
 });
 
 /* --------------------------------------------------------------- controls */
 btnReset.addEventListener('click', () => {
   userMovedCamera = false;
   fitCamera(true);
-});
-
-btnFeed.addEventListener('click', () => {
-  state.feedOn = !state.feedOn;
-  feedPanel.classList.toggle('hidden', !state.feedOn);
-  btnFeed.classList.toggle('active', state.feedOn);
-  if (state.feedOn) {
-    startFeed();
-  } else {
-    feedImg.removeAttribute('src');
-    feedImg.classList.remove('live');
-  }
 });
 
 btnFull.addEventListener('click', () => {
@@ -955,6 +940,7 @@ function applyAnimation(anim, t) {
 /** Play the source clip's audio track; the pose stream itself is silent. */
 function applySourceAudio() {
   btnSound.disabled = !state.audioUrl;
+  btnSound.classList.toggle('active', state.soundOn);
   if (!state.audioUrl) {
     sourceAudio.pause();
     sourceAudio.removeAttribute('src');
@@ -966,6 +952,7 @@ function applySourceAudio() {
     sourceAudio.currentTime = 0;
   }
   sourceAudio.muted = !state.soundOn;
+  sourceAudio.volume = state.soundOn ? 1 : 0;
   if (state.soundOn) {
     sourceAudio.play().catch(() => {
       // autoplay policy: needs a gesture, which the Sound button provides
@@ -978,8 +965,10 @@ function applySourceAudio() {
 
 btnSound.addEventListener('click', () => {
   state.soundOn = !state.soundOn;
+  localStorage.setItem('mocap.sound', state.soundOn ? 'on' : 'off');
   btnSound.classList.toggle('active', state.soundOn);
   sourceAudio.muted = !state.soundOn;
+  sourceAudio.volume = state.soundOn ? 1 : 0;
   if (state.soundOn && state.audioUrl) {
     sourceAudio.play().catch(() => {
       showToast('Could not start audio', { error: true });
