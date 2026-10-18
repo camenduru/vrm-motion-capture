@@ -1,5 +1,7 @@
 # VRM Motion Capture
 
+https://github.com/user-attachments/assets/8dce8357-1b81-400e-9e33-70f74b9203ce
+
 Real-time webcam motion capture that drives a **VRM avatar** with **rtmlib**
 (RTMPose) pose estimation, rendered in the browser with **three.js** +
 `@pixiv/three-vrm`.
