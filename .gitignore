@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# VRM motion capture — only the app's own source is tracked.
+# Everything below is generated, downloaded or a third-party checkout; see
+# "Cloning this repository" in README.md for what a fresh clone needs.
+# ---------------------------------------------------------------------------
+
+# --- Python ----------------------------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+develop-eggs/
+sdist/
+wheels/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- Frontend (Vite) -------------------------------------------------------
+web/node_modules/
+web/dist/
+web/.vite/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Pose models (scripts/download_models.py, ~200 MB) ---------------------
+models/*.onnx
+models/*.ort
+models/*.pt
+models/*.pth
+
+# --- Third-party checkouts (nested git clones, see README) -----------------
+rtmlib/
+RTMPose/
+
+# --- Runtime output --------------------------------------------------------
+*.log
+
+# --- Local tool state ------------------------------------------------------
+.freebuff/
+
+# --- Editor / OS -----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Note: videos/ ships the demo live-pose clips referenced by the README.
+#       Clips added through the UI land there too — delete the ones you do not
+#       want to commit before staging.

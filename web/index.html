@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#07080c" />
+    <title>VRM Motion Capture</title>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="scene"></canvas>
+      <div class="vignette"></div>
+
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark"><i></i></span>
+          <div class="brand-text">
+            <h1>MOTION CAPTURE</h1>
+            <p>rtmlib · RTMPose <span>→</span> VRM</p>
+          </div>
+        </div>
+        <div class="status-pill" id="status-pill">
+          <span class="status-dot" id="status-dot"></span>
+          <span id="status-text">initializing</span>
+        </div>
+      </header>
+
+      <aside class="feed" id="feed-panel">
+        <img id="feed" alt="Camera pose preview" />
+        <div class="feed-placeholder" id="feed-placeholder">
+          <span class="pulse"></span>
+          <p>waiting for camera</p>
+        </div>
+        <div class="feed-label"><span class="rec"></span>LIVE POSE</div>
+        <div class="feed-meta" id="feed-meta">—</div>
+      </aside>
+
+      <div class="stats">
+        <div class="stat"><span class="k">render</span><span class="v" id="stat-render">—</span></div>
+        <div class="stat"><span class="k">pose</span><span class="v" id="stat-pose">—</span></div>
+        <div class="stat"><span class="k">model</span><span class="v" id="stat-model">—</span></div>
+      </div>
+
+      <div class="actions">
+        <label class="picker">
+          <span>pose source</span>
+          <select id="source-select" aria-label="Pose source"></select>
+        </label>
+        <label class="picker">
+          <span>compute</span>
+          <select id="device-select" aria-label="Compute device">
+            <option value="auto">auto</option>
+            <option value="cuda">gpu (cuda)</option>
+            <option value="cpu">cpu</option>
+          </select>
+        </label>
+        <input id="file-input" type="file" hidden
+               accept="video/*,.mp4,.webm,.mov,.mkv,.m4v,.avi" />
+        <button id="btn-upload" type="button">Add video…</button>
+        <button id="btn-reset" type="button">Reset view</button>
+        <button id="btn-feed" type="button" class="active">Feed</button>
+        <button id="btn-fullscreen" type="button">Fullscreen</button>
+      </div>
+
+      <p class="hint">
+        Stand back so your shoulders and hips are visible
+        <span>·</span> raise an arm to test tracking
+      </p>
+
+      <div class="loader" id="loader">
+        <div class="loader-inner">
+          <div class="spinner"></div>
+          <p id="loader-text">Loading avatar…</p>
+          <div class="progress"><span id="loader-bar"></span></div>
+        </div>
+      </div>
+
+      <div class="toast" id="toast"></div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

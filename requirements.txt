@@ -1,0 +1,26 @@
+# Runtime dependencies for the VRM webcam motion-capture app.
+#
+#   python -m venv .venv
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt      (Windows)
+#   .venv/bin/python -m pip install -r requirements.txt             (macOS/Linux)
+#
+# For GPU inference on NVIDIA cards, swap the CPU build for a CUDA build plus
+# the matching CUDA/cuDNN runtime wheels (onnxruntime-gpu bundles neither).
+# The ORT version fixes the CUDA major: 1.26 is CUDA 12.8 + cuDNN 9, while
+# 1.27+ - now the PyPI default - wants CUDA 13, which has no Windows wheels.
+#   .venv\Scripts\python.exe -m pip uninstall -y onnxruntime
+#   .venv\Scripts\python.exe -m pip install "onnxruntime-gpu>=1.26,<1.27" ^
+#       nvidia-cudnn-cu12 nvidia-cublas-cu12 nvidia-cuda-runtime-cu12
+# The app then picks the GPU automatically (--device auto) and falls back to
+# CPU when the runtime cannot load.
+
+fastapi
+uvicorn
+websockets
+onnxruntime
+opencv-python-headless
+numpy
+tqdm
+
+# Pose estimation library (the checkout in ./rtmlib)
+-e ./rtmlib
