@@ -1,0 +1,36 @@
+# Build context for the VRM motion-capture image.
+# Everything the app needs at runtime is kept: app code, models/, MuseTalk/
+# (code + weights), rtmlib/, web sources, videos/ and vrm_models/.
+
+# ---- local / generated state ----------------------------------------------
+.venv/
+venv/
+env/
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+.git/
+.gitignore
+.cache/
+animations/
+audio/
+*.log
+.freebuff/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- frontend ------------------------------------------------------------
+web/node_modules/
+web/dist/
+web/.vite/
+npm-debug.log*
+
+# ---- MuseTalk scratch ----------------------------------------------------
+MuseTalk/results/
+MuseTalk/data/
+MuseTalk/.venv/
+
+# ---- local tooling -------------------------------------------------------
+web/node_modules/.cache/

@@ -209,6 +209,40 @@ A few local patches make the checkout work with current dependencies: no
 landmarks instead of DWPose), `np.int` → `int`, and `weights_only=False` for
 the legacy checkpoints under torch ≥ 2.6.
 
+## Docker
+
+The image is self-contained — app code, the built three.js bundle, the pose and
+face models, the avatar, and MuseTalk v1.5 with its weights are all baked in.
+`HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` make "no model downloads at
+runtime" a guarantee rather than a promise.
+
+```shell
+docker build -t camenduru/vrm-motion-capture .
+docker run --rm -it --gpus all -p 8000:8000 \
+  -v "$PWD/animations:/app/animations" camenduru/vrm-motion-capture
+# or simply:  docker compose up --build
+```
+
+Then open <http://localhost:8000>. Without `--gpus all` the app still runs —
+`--device auto` falls back to CPU with the lightweight models.
+
+To publish it:
+
+```shell
+docker login
+docker push camenduru/vrm-motion-capture:latest
+```
+
+Build from a working tree that has `models/` and `MuseTalk/models/` present:
+they are gitignored, so a bare `git clone` does not contain them. Expect a
+~12–14 GB image (build context ~5 GB).
+
+Two Python environments live inside: `/opt/app` (onnxruntime-gpu 1.26, i.e.
+CUDA 12.8 + cuDNN 9, matching the `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04`
+base) and `/opt/musetalk` (torch cu126 + diffusers), which
+`MuseTalk/.musetalk_python` points at. The `.vrma` files you generate land in
+`animations/`; mount that to keep them outside the container.
+
 ## API
 
 | endpoint | purpose |

@@ -1,0 +1,25 @@
+services:
+  vrm-motion-capture:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: camenduru/vrm-motion-capture
+    container_name: vrm-motion-capture
+    ports:
+      - "8000:8000"
+    environment:
+      # GPU access for onnxruntime-gpu and the MuseTalk torch stack
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # keep the generated .vrma files and any uploaded clips outside the image
+    volumes:
+      - ./animations:/app/animations
+      - ./videos:/app/videos
+    restart: unless-stopped
