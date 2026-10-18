@@ -87,12 +87,23 @@ const controls = new OrbitControls(camera, canvas);
 controls.target.set(0, FRAME.centerY, 0);
 controls.enableDamping = true;
 controls.dampingFactor = 0.06;
-controls.enablePan = false;
+// left-drag orbits, right-drag slides the avatar around the frame, wheel zooms
+controls.enablePan = true;
+controls.screenSpacePanning = true;
+controls.panSpeed = 1;
+controls.mouseButtons = {
+  LEFT: THREE.MOUSE.ROTATE,
+  MIDDLE: THREE.MOUSE.DOLLY,
+  RIGHT: THREE.MOUSE.PAN,
+};
 controls.minDistance = 1.2;
 controls.maxDistance = 12;
 controls.minPolarAngle = 0.55;
 controls.maxPolarAngle = Math.PI / 2 - 0.02;
 controls.update();
+
+// right-drag is a pan gesture, so the browser menu must not steal it
+canvas.addEventListener('contextmenu', (event) => event.preventDefault());
 
 let userMovedCamera = false;
 controls.addEventListener('start', () => {
