@@ -4,9 +4,9 @@ MuseTalk cannot run inside this app's interpreter: it pins numpy 1.x and a
 torch/diffusers stack, while the app runs on Python 3.13. So a job is a
 subprocess in MuseTalk's own Python, driven by a generated realtime config.
 
-The generated clip lands in ``videos/`` where the normal pose source picker
-can play it; the existing MediaPipe face layer then drives the VRM mouth from
-it, which is what gives the avatar lip-synced speech.
+The dubbed clip is a transient input for the offline VRMA bake: it is written
+to ``.cache/lipsync`` (never ``videos/``) and deleted as soon as the bake that
+consumes it finishes. The only lasting artefact is ``animations/<name>.vrma``.
 """
 
 from __future__ import annotations
@@ -26,7 +26,9 @@ import cv2
 ROOT = Path(__file__).resolve().parent.parent
 MUSETALK = ROOT / 'MuseTalk'
 MODELS = MUSETALK / 'models'
-VIDEOS = ROOT / 'videos'
+# MuseTalk's dubbed clip is only an input for the VRMA bake - keep it in a
+# scratch folder (never in videos/) and delete it once the bake is done.
+CACHE = ROOT / '.cache' / 'lipsync'
 IMAGE_EXT = {'.png', '.jpg', '.jpeg', '.bmp', '.webp'}
 
 # Files the v1.5 realtime path loads (see scripts/setup_musetalk.py).
@@ -235,12 +237,13 @@ class LipSyncJob:
             if output is None:
                 raise RuntimeError('MuseTalk produced no video - see the log')
             stamp = time.strftime('%Y%m%d-%H%M%S')
-            VIDEOS.mkdir(parents=True, exist_ok=True)
-            final = VIDEOS / f'lipsync_{stamp}.mp4'
+            CACHE.mkdir(parents=True, exist_ok=True)
+            final = CACHE / f'lipsync_{stamp}.mp4'
             shutil.copyfile(output, final)
+            relative = final.relative_to(ROOT).as_posix()
             self._set(state='done', phase='done',
-                      message=f'{final.name} ({final.stat().st_size / 1e6:.1f} MB)',
-                      output=f'videos/{final.name}')
+                      message=f'{final.stat().st_size / 1e6:.1f} MB',
+                      output=relative)
         except Exception as exc:  # noqa: BLE001
             if self._cancel.is_set():
                 self._set(state='cancelled', phase='cancelled', error='')

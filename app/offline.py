@@ -146,6 +146,14 @@ class BakeJob:
         except Exception as exc:  # noqa: BLE001
             with self._lock:
                 self._status.update(state='error', error=str(exc))
+        finally:
+            # the MuseTalk dub is a throwaway input: never leave it behind
+            try:
+                cache = (Path(__file__).resolve().parent.parent / '.cache')
+                if cache in source.parents:
+                    source.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
 
     def cancel(self) -> dict:
         self._stop.set()

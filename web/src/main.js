@@ -276,6 +276,7 @@ const state = {
   uploadIntent: 'play',
   lipJob: false,
   busy: null,
+  busyIdle: 0,
 };
 
 let blinkExpression = null;
@@ -446,6 +447,32 @@ async function pollStatus() {
     if (!state.busy && status.audio_url !== state.audioUrl) {
       state.audioUrl = status.audio_url || '';
       applySourceAudio();
+    }
+
+    // The generate overlay is driven by the server's job state, not only by a
+    // local timer chain (background tabs throttle timers), so it can never sit
+    // on a stale label.
+    if (state.busy) {
+      try {
+        const lip = await (await fetch('/api/lipsync',
+          { cache: 'no-store' })).json();
+        if (lip.state === 'running') {
+          state.busyIdle = 0;
+          updateBusy(`MuseTalk: ${lip.phase || 'working'}… `
+            + `${Math.round(lip.elapsed || 0)}s`);
+        } else {
+          const job = await (await fetch('/api/bake',
+            { cache: 'no-store' })).json();
+          if (job.state === 'running') {
+            state.busyIdle = 0;
+            updateBusy(`Generating VRMA… ${Math.round(job.elapsed || 0)}s`);
+          } else if (++state.busyIdle >= 2) {
+            hideBusy();
+          }
+        }
+      } catch {
+        /* server busy; try again next poll */
+      }
     }
     const error = status.state === 'error' ? (status.error || 'Source unavailable') : '';
     state.engineError = error;
@@ -797,26 +824,27 @@ async function pollLipSync() {
     return;
   }
   if (status.state === 'running') {
-    showToast(
-      `MuseTalk: ${status.phase || 'working'}… ${Math.round(status.elapsed || 0)}s`,
-      { sticky: true },
-    );
+    updateBusy(`MuseTalk: ${status.phase || 'working'}… `
+      + `${Math.round(status.elapsed || 0)}s`);
     lipPollTimer = window.setTimeout(pollLipSync, 1500);
     return;
   }
   if (status.state === 'error') {
     state.lipJob = false;
+    hideBusy();
     showToast(`Lip sync failed: ${status.error}`,
       { sticky: true, error: true });
     return;
   }
   if (status.state === 'cancelled') {
     state.lipJob = false;
+    hideBusy();
     showToast('MuseTalk stopped');
     return;
   }
   if (status.state === 'done') {
     state.lipJob = false;
+    updateBusy('Generating VRMA…');
     // MuseTalk's clip goes through the same offline bake (no source switch)
     await bakeVideo(status.output);
   }
