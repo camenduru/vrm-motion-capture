@@ -35,14 +35,14 @@ RUN npm run build
 # CUDA 12.8 + cuDNN 9 matches onnxruntime-gpu 1.26; Ubuntu 24.04 brings Py 3.12.
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 
+# MUSETALK_PYTHON is the interpreter app/lipsync.py looks for;
+# HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE hard-guarantee no runtime downloads.
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    # the MuseTalk interpreter our lipsync module looks for
     MUSETALK_PYTHON=/opt/musetalk/bin/python \
-    # hard guarantee: no model download at runtime
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1
 
