@@ -63,13 +63,15 @@ start.bat --source camera:1 --mode balanced                    # second webcam, 
 | **compute** | rebuild the models on `auto` / `gpu (cuda)` / `cpu` without restarting; `auto` uses the accurate models on a GPU and the light ones on CPU |
 | **Add video…** | upload a clip (`.mp4 .webm .mov .mkv`, max 512 MB) — it is stored in `videos/` and used as the live pose source |
 | **Feed / Reset view / Fullscreen** | hide the pose preview, re-frame the avatar, go fullscreen |
-| drag / scroll | orbit and zoom the camera around the avatar |
+| left-drag / right-drag / scroll | orbit · slide the avatar around the frame · zoom |
 
 The avatar mirrors you: raise your right hand and the arm on the right of the
 screen moves. Tracking runs while your shoulders and hips are visible; when
 tracking is lost the avatar falls back to the `idle_loop.vrma` animation and
-fades back in when you are detected again. A small HUD shows render fps, pose
-fps and the active model preset.
+fades back in when you are detected again. The face is driven from the same
+frames — expressions and head pose — so a close-up alone still animates the
+avatar and the status pill reads **face only**. A small HUD shows render fps,
+pose fps and the active model preset.
 
 ## Command line
 
@@ -80,6 +82,8 @@ python -m app.server [options]
 --mode      auto | performance | balanced | lightweight   (default auto: performance on GPU, lightweight on CPU)
 --device    auto | cpu | cuda | mps         (default auto: CUDA when available)
 --det-frequency  N   run person detection every N frames (default 6)
+--face-every    N   run the face model every N frames (default 2)
+--face / --no-face  facial expressions + head pose (default on)
 --host / --port      default 127.0.0.1:8000
 ```
 
@@ -126,13 +130,46 @@ failing, and the HUD shows the active preset and device (`balanced · cuda`).
 `--det-frequency` trades detector cost against how often the tracker re-finds
 you: the pose model runs every frame, person detection only every Nth frame.
 
+### Face tracking
+
+The face layer runs MediaPipe's FaceLandmarker on the same (already mirrored)
+frames. With every pose it sends the head-pose quaternion and the 52
+ARKit-style blendshape coefficients, which the web layer maps onto the VRM
+expressions:
+
+| blendshapes | expression |
+| --- | --- |
+| `eyeBlinkLeft` / `Right` | `blink` |
+| `jawOpen` | `aa` |
+| `mouthPucker` | `ou` |
+| `jawOpen` × `mouthFunnel` | `oh` |
+| `mouthStretchLeft` / `Right` | `ee` |
+| `mouthSmileLeft` / `Right` | `happy` |
+| `browDownLeft` / `Right` | `angry` |
+| `mouthFrown*` + `browInnerUp` | `sad` |
+| `browInnerUp` + `eyeWide*` | `surprised` |
+
+While a face is locked the head bone follows the measured head pose; when the
+face is lost the body keypoints take the head back over. A close-up with no
+body still animates the face — the status pill then reads **face only**.
+
+The model is a separate download:
+
+```shell
+python scripts/download_models.py --set face
+```
+
+Face inference costs ~9 ms a frame, so it runs every `--face-every` frames
+(default 2) and reuses the last result in between — that keeps a 30 fps source
+at 30 fps. `--no-face` turns the layer off completely.
+
 ## API
 
 | endpoint | purpose |
 | --- | --- |
 | `GET /` | the app (built frontend) |
 | `GET /video` | MJPEG pose preview (skeleton drawn server-side) |
-| `GET /api/status` | engine state, source, resolution, fps, detection, active device + preset |
+| `GET /api/status` | engine state, source, resolution, fps, detection, face on/off, active device + preset |
 | `GET /api/sources` | pickable pose sources |
 | `POST /api/source` | `{"source": "videos/clip.mp4"}` |
 | `POST /api/device` | `{"device": "auto" \| "cuda" \| "cpu"}` — rebuilds the models on that device |

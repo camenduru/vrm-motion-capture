@@ -50,6 +50,8 @@ const JOINT_CONF = 0.3;
 const TAU_HEAD = 0.08;
 const TAU_ROOT = 0.09;
 const TAU_BLEND = 0.2;
+const TAU_FACE = 0.045;      // expression weight smoothing
+const TAU_FACE_HEAD = 0.07;  // facial head pose smoothing
 
 // One Euro filter bands for the two fast, noisy signals: joint positions
 // (pixels) and limb directions (radians). A fixed time constant has to choose
@@ -111,6 +113,17 @@ export class MocapRetargeter {
     this.hasJoint = new Uint8Array(17);
     this.blend = 0;
     this.head = { yaw: 0, roll: 0 };
+    // Facial layer: MediaPipe gives a head quaternion (world space, since the
+    // frame it sees is already mirrored like the preview) and ARKit-style
+    // blendshape weights, which are mapped onto the VRM expression presets.
+    this.face = {
+      q: new THREE.Quaternion(),
+      target: new THREE.Quaternion(),
+      headW: 0,
+      weights: Object.create(null),
+      fresh: false,
+    };
+    this._faceNames = null;
     this.facing = 1; // +1 person faces the camera, -1 they turned away
     this.dirState = new Map();
     // longest each limb has been seen to project, relative to this avatar's
@@ -309,6 +322,10 @@ export class MocapRetargeter {
     if (!this.enabled || !this.b.hips) return;
     dt = clamp(dt, 0.001, 0.1);
 
+    // the face layer runs even when no body is in frame (a close-up), so it
+    // must happen before the body early-returns below
+    this.updateFace(pose, dt);
+
     const hasPose = !!pose && Array.isArray(pose.keypoints) &&
       pose.keypoints.length >= 17;
     if (hasPose) {
@@ -433,9 +450,118 @@ export class MocapRetargeter {
     this.root.position.lerp(this._target, damp(dt, TAU_ROOT));
   }
 
+  /** VRM expression names this avatar actually has, resolved once. */
+  faceExpressions() {
+    if (this._faceNames) return this._faceNames;
+    const em = this.vrm && this.vrm.expressionManager;
+    if (!em) return null;
+    const map = em.expressionMap || {};
+    const pick = (...names) => names.find((n) => n in map) || null;
+    this._faceNames = {
+      blink: pick('blink'),
+      blinkLeft: pick('blinkLeft', 'blink_l'),
+      blinkRight: pick('blinkRight', 'blink_r'),
+      aa: pick('aa', 'a'),
+      ih: pick('ih', 'i'),
+      ou: pick('ou', 'u'),
+      ee: pick('ee', 'e'),
+      oh: pick('oh', 'o'),
+      happy: pick('happy'),
+      angry: pick('angry'),
+      sad: pick('sad'),
+      relaxed: pick('relaxed'),
+      surprised: pick('surprised'),
+    };
+    return this._faceNames;
+  }
+
+  /**
+   * Drive the face from `pose.face` (head quaternion + blendshapes).
+   * Falls back to zero weights when the face is lost, so expressions ease out
+   * instead of sticking.
+   */
+  updateFace(pose, dt) {
+    const face = pose && pose.face ? pose.face : null;
+    const hasQ = !!(face && Array.isArray(face.q) && face.q.length === 4);
+    const fresh = !!(face && face.blend);
+    this.face.fresh = fresh;
+
+    // --- head ------------------------------------------------------------
+    if (hasQ) {
+      this.face.target.set(face.q[0], face.q[1], face.q[2], face.q[3]);
+      if (this.face.target.lengthSq() < 1e-6) this.face.target.identity();
+      else this.face.target.normalize();
+    }
+    this.face.headW += ((hasQ ? 1 : 0) - this.face.headW) *
+      damp(dt, TAU_FACE_HEAD);
+
+    const head = this.b.head;
+    if (head && this.restHeadLocal && this.face.headW > 0.001) {
+      this.face.q.slerp(this.face.target, damp(dt, TAU_FACE_HEAD));
+      this.vrm.scene.updateMatrixWorld(true);
+      head.parent.getWorldQuaternion(this._q3);
+      this._q4.copy(this._q3).invert()
+        .multiply(this.face.q).multiply(this._q3);
+      this._headTarget.copy(this.restHeadLocal).premultiply(this._q4);
+      head.quaternion.slerp(this._headTarget, this.face.headW);
+    }
+
+    // --- expressions -----------------------------------------------------
+    const em = this.vrm && this.vrm.expressionManager;
+    const names = this.faceExpressions();
+    if (!em || !names) return;
+
+    const g = (name) => (fresh ? (face.blend[name] || 0) : 0);
+    const avg = (a, b) => (g(a) + g(b)) * 0.5;
+    // ARKit coefficients idle around 0.02-0.08; the soft floor keeps a resting
+    // face from twitching its brows and mouth
+    const s = (v) => (v <= 0.06 ? 0 : Math.min(1, (v - 0.06) / 0.94));
+
+    const jaw = s(g('jawOpen'));
+    const smile = s(avg('mouthSmileLeft', 'mouthSmileRight'));
+    const frown = s(avg('mouthFrownLeft', 'mouthFrownRight'));
+    const pucker = s(g('mouthPucker'));
+    const funnel = s(g('mouthFunnel'));
+    const stretch = s(avg('mouthStretchLeft', 'mouthStretchRight'));
+    const browDown = s(avg('browDownLeft', 'browDownRight'));
+    const browIn = s(g('browInnerUp'));
+    const browOut = s(avg('browOuterUpLeft', 'browOuterUpRight'));
+    const eyeWide = s(avg('eyeWideLeft', 'eyeWideRight'));
+    const squint = s(avg('eyeSquintLeft', 'eyeSquintRight'));
+
+    const targets = {
+      blink: s(avg('eyeBlinkLeft', 'eyeBlinkRight')),
+      aa: jaw,
+      ou: pucker,
+      oh: Math.min(1, jaw * funnel * 1.7 + funnel * 0.2),
+      ee: stretch,
+      // no direct ARKit source for a closed "ih" mouth, and deriving it from
+      // the smile just double-drives `happy`, so it stays unused
+      ih: 0,
+      happy: Math.min(1, smile * (1 - 0.6 * jaw)),
+      angry: Math.min(1, browDown * 0.9 + frown * 0.3),
+      sad: clamp(frown * 0.7 + browIn * 0.35 - browOut * 0.2, 0, 1),
+      surprised: Math.min(1, browIn * 0.75 + eyeWide * 0.55),
+      relaxed: Math.min(1, squint * 0.3),
+    };
+
+    const a = damp(dt, TAU_FACE);
+    for (const key of Object.keys(targets)) {
+      const name = names[key];
+      if (!name) continue;
+      const want = targets[key];
+      const cur = this.face.weights[key] || 0;
+      const next = cur + (want - cur) * a;
+      this.face.weights[key] = next;
+      if (next > 0.0005 || cur > 0.0005) em.setValue(name, next);
+    }
+  }
+
   updateHead(dt, weight, k) {
     const head = this.b.head;
     if (!head) return;
+    // when the facial tracker has a lock it owns the head pose outright
+    if (this.face.headW > 0.001) return;
     let roll = this.head.roll;
     let yaw = this.head.yaw;
 
@@ -496,6 +622,10 @@ export class MocapRetargeter {
     this.facing = 1;
     this.head.roll = 0;
     this.head.yaw = 0;
+    this.face.q.identity();
+    this.face.target.identity();
+    this.face.headW = 0;
+    this.face.weights = Object.create(null);
     this.root.position.set(0, 0, 0);
   }
 }

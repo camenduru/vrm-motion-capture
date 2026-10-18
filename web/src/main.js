@@ -570,7 +570,10 @@ function updateHud(dt, renderFps) {
 
   const fresh = state.pose && performance.now() - state.poseAt < 800;
   const tracking = fresh && state.detected;
-  statusPill.classList.toggle('live', tracking);
+  // the face layer can be locked on while the body is out of frame (close-up)
+  const faceLive = fresh && !!(state.pose && state.pose.face &&
+    state.pose.face.blend);
+  statusPill.classList.toggle('live', tracking || faceLive);
   statusPill.classList.toggle('offline', !!state.engineError || !state.wsOpen);
 
   if (state.engineError) {
@@ -579,6 +582,8 @@ function updateHud(dt, renderFps) {
     statusText.textContent = 'reconnecting';
   } else if (tracking) {
     statusText.textContent = 'tracking';
+  } else if (faceLive) {
+    statusText.textContent = 'face only';
   } else {
     statusText.textContent = 'searching for pose';
   }

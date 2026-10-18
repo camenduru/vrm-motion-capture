@@ -20,6 +20,7 @@ websockets
 onnxruntime
 opencv-python-headless
 numpy
+mediapipe
 tqdm
 
 # Pose estimation library (the checkout in ./rtmlib)

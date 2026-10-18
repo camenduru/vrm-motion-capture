@@ -279,7 +279,9 @@ class PoseEngine:
                  source: str = 'camera:0',
                  mode: str = 'auto',
                  device: str = 'auto',
-                 det_frequency: int = 6):
+                 det_frequency: int = 6,
+                 face: bool = True,
+                 face_every: int = 2):
         if mode != 'auto' and mode not in MODEL_SETS:
             raise ValueError(f'Unknown mode {mode!r}. '
                              f'Choose from {sorted(MODEL_SETS)} or auto')
@@ -290,6 +292,11 @@ class PoseEngine:
         self._active_mode = mode
         self._active_device = device
         self.det_frequency = max(1, det_frequency)
+        self.face_enabled = face
+        self.face_every = max(1, face_every)
+        self._face_engine = None
+        self._face_tick = 0
+        self._face_cache: Optional[dict] = None
         self.source = source
         self.is_demo = source == 'demo'
 
@@ -315,6 +322,7 @@ class PoseEngine:
             'device': device,
             'device_pref': device,
             'gpu_available': _resolve_device('auto') == 'cuda',
+            'face': False,
             'width': 0,
             'height': 0,
             'fps': 0.0,
@@ -491,6 +499,8 @@ class PoseEngine:
         self._demo = None
         self._frame_interval = 0.0
         self._frame_due = 0.0
+        self._face_cache = None
+        self._face_tick = 0
         if self._tracker is not None and hasattr(self._tracker, 'reset'):
             self._tracker.reset()
 
@@ -549,12 +559,31 @@ class PoseEngine:
             self._tracker = self._build_tracker()
         return self._tracker
 
+    def _ensure_face(self):
+        """Start the facial layer once; disable it if it cannot start."""
+        if not self.face_enabled or self._face_engine is not None:
+            return
+        from .face_engine import FaceEngine
+
+        print('[face] loading mediapipe face landmarker...', flush=True)
+        engine = FaceEngine()
+        if engine.open():
+            self._face_engine = engine
+            with self._lock:
+                self._status['face'] = True
+        else:
+            print(f'[face] off: {engine.error}', flush=True)
+            self.face_enabled = False
+
     def stop(self):
         self._running = False
         if self._thread:
             self._thread.join(timeout=3)
         if self._cap is not None:
             self._cap.release()
+        if self._face_engine is not None:
+            self._face_engine.close()
+            self._face_engine = None
 
     def _set_status(self, state: str, error: Optional[str]):
         with self._lock:
@@ -614,6 +643,9 @@ class PoseEngine:
                     time.sleep(2.0)
                     continue
 
+            if not self.is_demo:
+                self._ensure_face()
+
             frame = self._next_frame()
             if frame is None:
                 if self._cap is not None:
@@ -652,6 +684,23 @@ class PoseEngine:
                     print(f'[pose] inference failed: {exc}', flush=True)
                     time.sleep(0.05)
 
+            face = self._face_cache
+            if self._face_engine is not None:
+                self._face_tick += 1
+                if self._face_tick % self.face_every == 0:
+                    try:
+                        face = self._face_engine.process(frame)
+                        self._face_cache = face
+                    except Exception as exc:  # noqa: BLE001
+                        print(f'[face] disabled: {exc}', flush=True)
+                        self._face_engine.close()
+                        self._face_engine = None
+                        self.face_enabled = False
+                        face = None
+                        self._face_cache = None
+                        with self._lock:
+                            self._status['face'] = False
+
             preview = self._render_preview(frame, keypoints, scores)
             ok, encoded = cv2.imencode(
                 '.jpg', preview, [cv2.IMWRITE_JPEG_QUALITY, 78])
@@ -673,6 +722,7 @@ class PoseEngine:
                     if keypoints is not None else [],
                     'scores': np.round(scores, 4).tolist()
                     if scores is not None else [],
+                    'face': face,
                     'width': w,
                     'height': h,
                 }

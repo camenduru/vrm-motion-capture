@@ -242,6 +242,12 @@ def main() -> None:
                         help='onnxruntime device: auto, cpu, cuda, mps')
     parser.add_argument('--det-frequency', type=int, default=6,
                         help='run person detection every N frames')
+    parser.add_argument('--face', action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help='track facial expressions and head pose '
+                             '(default on; --no-face disables)')
+    parser.add_argument('--face-every', type=int, default=2,
+                        help='run the face model every N frames (default 2)')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8000)
     args = parser.parse_args()
@@ -253,7 +259,9 @@ def main() -> None:
     pose_engine = PoseEngine(source=args.source,
                              mode=args.mode,
                              device=args.device,
-                             det_frequency=args.det_frequency)
+                             det_frequency=args.det_frequency,
+                             face=args.face,
+                             face_every=args.face_every)
     uvicorn.run(create_app(pose_engine),
                 host=args.host,
                 port=args.port,

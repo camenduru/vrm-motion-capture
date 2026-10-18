@@ -39,6 +39,7 @@ models/*.pth
 # --- Third-party checkouts (nested git clones, see README) -----------------
 rtmlib/
 RTMPose/
+MuseTalk/
 
 # --- Runtime output --------------------------------------------------------
 *.log
