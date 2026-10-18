@@ -517,7 +517,10 @@ class PoseEngine:
         self.is_demo = self.source == 'demo'
 
         if self.source in ('none', ''):
-            # deliberately no input: the engine idles and serves the last frame
+            # deliberately no input: drop the last frame so the preview does
+            # not keep showing a stale picture from the previous source
+            with self._lock:
+                self._jpeg = None
             self._frame_interval = 0.0
             return
 

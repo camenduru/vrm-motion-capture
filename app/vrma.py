@@ -37,8 +37,13 @@ def write_vrma(path: Path, data: dict) -> dict:
                                           "expr": {name: weight}}]}
     """
     frames = data.get('frames') or []
+    # samplers need strictly increasing times: drop repeats and sort
+    unique = {}
+    for frame in frames:
+        unique[float(frame['t'])] = frame
+    frames = [unique[t] for t in sorted(unique)]
     if len(frames) < 2:
-        raise ValueError('need at least two frames to build an animation')
+        raise ValueError('need at least two distinct frames to animate')
 
     bone_names = []
     expr_names = []

@@ -50,6 +50,8 @@ const sourceSelect = document.getElementById('source-select');
 const deviceSelect = document.getElementById('device-select');
 const btnUpload = document.getElementById('btn-upload');
 const btnGenerate = document.getElementById('btn-generate');
+const busyEl = document.getElementById('busy');
+const busyText = document.getElementById('busy-text');
 const btnLoadVrma = document.getElementById('btn-load-vrma');
 const vrmaInput = document.getElementById('vrma-input');
 const btnRealtime = document.getElementById('btn-realtime');
@@ -273,6 +275,7 @@ const state = {
   vrmaMixer: null,
   uploadIntent: 'play',
   lipJob: false,
+  busy: null,
 };
 
 let blinkExpression = null;
@@ -430,14 +433,17 @@ async function pollStatus() {
         ? 'gpu (unavailable)'
         : 'gpu (cuda)';
     }
-    if (status.source) {
+    // while a bake runs the engine is playing the file being recorded; keep
+    // the UI on the user's own source and stay silent
+    if (status.source && !state.busy) {
       state.source = status.source;
       if (sourceSelect.value && sourceSelect.value !== status.source &&
           status.state !== 'switching') {
         sourceSelect.value = status.source;
       }
+      syncFeed(status.source);
     }
-    if (status.audio_url !== state.audioUrl) {
+    if (!state.busy && status.audio_url !== state.audioUrl) {
       state.audioUrl = status.audio_url || '';
       applySourceAudio();
     }
@@ -480,9 +486,9 @@ async function switchSource(source) {
     }
     state.source = source;
     state.poseAt = 0;
-    // a new source means live tracking again; drop any baked playback/bake
+    // a new source ends any baked playback; a running recording is kept,
+    // because starting a bake switches the source first
     state.animation = null;
-    state.recording = null;
     startFeed();
     return true;
   } catch (err) {
@@ -491,7 +497,11 @@ async function switchSource(source) {
   }
 }
 
-sourceSelect.addEventListener('change', () => switchSource(sourceSelect.value));
+sourceSelect.addEventListener('change', () => {
+  // the select is also synced from /api/status; only act on a real change
+  if (sourceSelect.value === state.source) return;
+  switchSource(sourceSelect.value);
+});
 
 async function switchDevice(device) {
   try {
@@ -586,31 +596,53 @@ function stopLipSync() {
   fetch('/api/lipsync/cancel', { method: 'POST' }).catch(() => {});
 }
 
+/* --------------------------------------------------------- VRMA (offline) */
+function showBusy(text) {
+  state.busy = text || 'Generating VRMA…';
+  busyText.textContent = state.busy;
+  busyEl.classList.remove('hidden');
+  syncGenerateButton();
+}
+
+function updateBusy(text) {
+  if (text) state.busy = text;
+  busyText.textContent = state.busy;
+}
+
+function hideBusy() {
+  state.busy = null;
+  busyEl.classList.add('hidden');
+  syncGenerateButton();
+}
+
 /**
- * Offline: bake a VRM Animation from a video the user picks. With the lip-sync
- * driver set to `musetalk`, MuseTalk re-drives the mouth first and its clip is
- * what gets baked; with `face landmarks` the video is baked directly.
+ * Offline: bake a VRM Animation from a video the user picks.
+ *
+ * This is a separate pipeline from the live one: the server extracts the video
+ * on its own tracker (no source switch, no preview, no audio), the browser then
+ * replays those frames through the retargeter and stores the result. The screen
+ * is blanked for the whole thing.
  */
-btnGenerate.addEventListener('click', () => {
-  if (state.recording || state.lipJob) {
-    // stop early: keep whatever was captured so far
+btnGenerate.addEventListener('click', async () => {
+  if (state.busy) {
+    await Promise.all([
+      fetch('/api/bake/cancel', { method: 'POST' }).catch(() => {}),
+      fetch('/api/lipsync/cancel', { method: 'POST' }).catch(() => {}),
+    ]);
     state.lipJob = false;
-    stopLipSync();
-    stopBake();
-    syncGenerateButton();
+    hideBusy();
     return;
   }
   state.uploadIntent = 'generate';
   fileInput.click();
 });
 
-/** Generate VRMA doubles as the stop control while it is working. */
 function syncGenerateButton() {
-  const busy = !!state.recording || state.lipJob;
+  const busy = !!state.busy;
   btnGenerate.classList.toggle('active', busy);
-  btnGenerate.textContent = busy ? 'Stop recording' : 'Generate VRMA…';
+  btnGenerate.textContent = busy ? 'Stop' : 'Generate VRMA…';
   btnGenerate.title = busy
-    ? 'Stop now and keep what has been recorded'
+    ? 'Stop generating'
     : 'Pick a video and bake it into a .vrma';
 }
 
@@ -620,24 +652,79 @@ async function startGenerate(source) {
     showToast('Pick a video first', { sticky: true, error: true });
     return;
   }
-  const stem = source.split('/').pop().replace(/\.[^.]+$/, '');
 
   if (state.lipsyncMode === 'musetalk') {
-    // offline only: no realtime state, no source change, avatar stays idle
-    state.animation = null;
-    state.recording = null;
-    syncRealtimeButton();
-    showToast('MuseTalk: processing offline - no realtime tracking',
-      { sticky: true });
+    // MuseTalk dubs the video first; its clip is then baked the same way
+    state.lipJob = true;
+    showBusy('MuseTalk: processing the video…');
     startLipSync(source, source);
     return;
   }
 
-  // the landmark bake records what the retargeter produces; tracking is
-  // driven by the recording itself, never by the realtime switch
-  showToast('Recording the VRMA from the video…', { sticky: true });
-  await switchSource(source);      // restart from the first frame
-  startBake(`${stem}.vrma`);
+  await bakeVideo(source);
+}
+
+async function bakeVideo(source) {
+  const stem = source.split('/').pop().replace(/\.[^.]+$/, '');
+  showBusy('Generating VRMA…');
+  try {
+    const start = await fetch('/api/bake', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source }),
+    });
+    const job = await start.json().catch(() => ({}));
+    if (!start.ok) throw new Error(job.error || `HTTP ${start.status}`);
+
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 400));
+      const status = await (await fetch('/api/bake',
+        { cache: 'no-store' })).json();
+      if (status.state !== 'running') {
+        if (status.state !== 'done') {
+          throw new Error(status.error || 'bake failed');
+        }
+        break;
+      }
+      updateBusy(`Generating VRMA… ${status.elapsed}s`);
+    }
+
+    const full = await (await fetch('/api/bake?full=1',
+      { cache: 'no-store' })).json();
+    const frames = full.frames || [];
+    if (frames.length < 2) throw new Error('nothing to bake');
+    await recordFrames(frames, `${stem}.vrma`);
+    showToast(`VRMA saved: animations/${stem}.vrma`);
+  } catch (err) {
+    showToast(`VRMA failed: ${err.message}`, { sticky: true, error: true });
+  } finally {
+    hideBusy();
+  }
+}
+
+/** Replay extracted frames through the retargeter and store the .vrma. */
+async function recordFrames(frames, name) {
+  const rt = state.retargeter;
+  if (!rt) throw new Error('avatar not loaded');
+  const fps = frames[0].fps || 30;
+  const out = [];
+  for (const frame of frames) {
+    rt.update(frame, 1 / fps);
+    const captured = captureFrame(frame.t);
+    if (captured) out.push(captured);
+  }
+  rt.reset();
+  if (out.length < 2) throw new Error('nothing was tracked in that video');
+
+  const anim = { fps, duration: out[out.length - 1].t, frames: out };
+  const save = await fetch(`/api/animation?name=${encodeURIComponent(name)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(anim),
+  });
+  const data = await save.json().catch(() => ({}));
+  if (!save.ok) throw new Error(data.error || `HTTP ${save.status}`);
+  return data;
 }
 
 /**
@@ -645,7 +732,7 @@ async function startGenerate(source) {
  * the offline path, so selecting it leaves this button inactive.
  */
 function syncRealtimeButton() {
-  const recording = !!state.recording || state.lipJob;
+  const recording = !!state.busy;
   const blocked = state.lipsyncMode === 'musetalk' || recording;
   const live = !blocked && state.liveDrive && !state.animation &&
     !state.vrmaMixer;
@@ -669,7 +756,6 @@ btnRealtime.addEventListener('click', () => {
   } else {
     state.liveDrive = true;
     state.animation = null;
-    state.recording = null;
     state.animStart = 0;
     // hand the bones back from any loaded .vrma to the live retargeter
     if (state.vrmaMixer) {
@@ -731,13 +817,8 @@ async function pollLipSync() {
   }
   if (status.state === 'done') {
     state.lipJob = false;
-    showToast(`Lip synced clip ready: ${status.output}`);
-    await loadSources();
-    await switchSource(status.output);
-    lipsyncMode.value = 'musetalk';
-    // bake the VRM animation the clip produces so it can be replayed
-    const stem = status.output.split('/').pop().replace(/\.[^.]+$/, '');
-    startBake(`${stem}.vrma`);
+    // MuseTalk's clip goes through the same offline bake (no source switch)
+    await bakeVideo(status.output);
   }
 }
 
@@ -772,6 +853,19 @@ feedImg.addEventListener('error', () => {
   window.setTimeout(startFeed, 2500);
 });
 
+/** With no source the stream goes idle; drop the stale frame. */
+function syncFeed(source) {
+  const idle = !source || source === 'none';
+  if (idle) {
+    if (feedImg.getAttribute('src')) {
+      feedImg.removeAttribute('src');
+      feedImg.classList.remove('live');
+    }
+  } else if (!feedImg.getAttribute('src')) {
+    startFeed();
+  }
+}
+
 /* --------------------------------------------------------------- controls */
 btnReset.addEventListener('click', () => {
   userMovedCamera = false;
@@ -805,9 +899,8 @@ async function playVRMA(url) {
   const mixer = new THREE.AnimationMixer(state.vrm.scene);
   mixer.clipAction(clip).play();
   state.vrmaMixer = mixer;
-  // replay takes over from live tracking / baked JSON playback
+  // replay takes over from live tracking / baked playback
   state.animation = null;
-  state.recording = null;
   state.liveDrive = false;
   syncRealtimeButton();
   return clip;
@@ -867,44 +960,6 @@ function captureFrame(t) {
 }
 
 /** Bake the pose stream that a clip is producing into a stored animation. */
-function startBake(name) {
-  state.animation = null;
-  state.recording = { name, frames: [], seq: -1, last: -1 };
-  syncGenerateButton();
-  showToast('Recording the VRMA… press Stop recording to finish early',
-    { sticky: true });
-}
-
-function stopBake() {
-  const rec = state.recording;
-  state.recording = null;
-  syncGenerateButton();
-  if (!rec) return;
-  if (rec.frames.length < 2) {
-    showToast('Stopped before anything was recorded');
-    return;
-  }
-
-  const anim = {
-    fps: rec.frames.length / Math.max(0.001, rec.frames[rec.frames.length - 1].t),
-    duration: rec.frames[rec.frames.length - 1].t,
-    frames: rec.frames,
-  };
-  fetch(`/api/animation?name=${encodeURIComponent(rec.name)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(anim),
-  })
-    .then((response) => response.json())
-    .then((data) => {
-      state.animation = anim;
-      state.animStart = performance.now() / 1000;
-      syncGenerateButton();
-      showToast(`VRMA saved: ${data.animation}`);
-    })
-    .catch(() => showToast('Could not save the animation', { error: true }));
-}
-
 function applyAnimation(anim, t) {
   const frames = anim.frames;
   if (!frames || frames.length < 2) return;
@@ -985,8 +1040,7 @@ function updateHud(dt, renderFps) {
 
   const fresh = state.pose && performance.now() - state.poseAt < 800;
   // the pill reports what the avatar is doing, not what the camera sees
-  const driving = state.liveDrive && !state.animation && !state.recording &&
-    !state.lipJob;
+  const driving = state.liveDrive && !state.animation && !state.busy;
   const tracking = driving && fresh && state.detected;
   // the face layer can be locked on while the body is out of frame (close-up)
   const faceLive = driving && fresh && !!(state.pose && state.pose.face &&
@@ -998,7 +1052,7 @@ function updateHud(dt, renderFps) {
     statusText.textContent = 'camera offline';
   } else if (!state.wsOpen) {
     statusText.textContent = 'reconnecting';
-  } else if (state.recording || state.lipJob) {
+  } else if (state.busy) {
     statusText.textContent = 'recording';
   } else if (state.animation || state.vrmaMixer) {
     statusText.textContent = 'replay';
@@ -1051,29 +1105,12 @@ function animate(now) {
       : (performance.now() / 1000 - state.animStart);
     applyAnimation(state.animation, t);
   } else if (state.retargeter) {
-    // a recording needs the retargeter even when realtime drive is off, so
-    // Generate VRMA never has to touch the realtime switch
-    const drive = state.liveDrive || !!state.recording;
+    // live mirror only; a generate run drives the rig itself, off-screen
+    const drive = state.liveDrive && !state.busy;
     state.retargeter.update(drive && fresh ? state.pose : null, dt);
   }
 
-  // bake one sample per new pose while a clip is being recorded
-  if (state.recording && state.pose &&
-      state.pose.seq !== state.recording.seq) {
-    state.recording.seq = state.pose.seq;
-    const mediaT = state.pose.media_t;
-    if (typeof mediaT === 'number') {
-      if (state.recording.last >= 0 && mediaT < state.recording.last - 1e-3) {
-        stopBake();                 // the clip looped; one pass is enough
-      } else {
-        state.recording.last = mediaT;
-        const frame = captureFrame(mediaT);
-        if (frame) state.recording.frames.push(frame);
-      }
-    }
-  }
-
-  if (!state.animation && !state.recording) updateBlink(dt);
+  if (!state.animation && !state.busy) updateBlink(dt);
 
   // keep the clip's own audio aligned with the frames the engine is showing
   const mediaT = state.pose && state.pose.media_t;

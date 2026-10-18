@@ -91,6 +91,14 @@
       <audio id="source-audio" loop preload="auto"></audio>
 
       <div class="toast" id="toast"></div>
+
+      <!-- covers everything while an offline generate runs -->
+      <div class="busy hidden" id="busy">
+        <div class="busy-inner">
+          <div class="spinner"></div>
+          <p id="busy-text">Generating VRMA…</p>
+        </div>
+      </div>
     </div>
     <script type="module" src="/src/main.js"></script>
   </body>

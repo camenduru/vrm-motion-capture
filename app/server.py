@@ -28,7 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .pose_engine import COCO_KEYPOINTS, VIDEO_EXT, PoseEngine
-from . import lipsync, vrma
+from . import lipsync, offline, vrma
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIST = ROOT / 'web' / 'dist'
@@ -57,6 +57,7 @@ def create_app(pose_engine: PoseEngine) -> FastAPI:
 
     app = FastAPI(title='VRM Motion Capture', lifespan=lifespan)
     lip_sync = lipsync.LipSyncJob()
+    bake = offline.BakeJob()
 
     @app.middleware('http')
     async def revalidate_avatar_assets(request, call_next):
@@ -258,6 +259,34 @@ def create_app(pose_engine: PoseEngine) -> FastAPI:
     @app.post('/api/lipsync/cancel')
     async def lipsync_cancel():
         return lip_sync.cancel()
+
+    # ------------------------------------------------------ offline VRMA bake
+    @app.post('/api/bake')
+    async def bake_start(payload: dict):
+        """Extract a video on a private pipeline (never touches the live one)."""
+        ref = str(payload.get('source', '')).strip()
+        path = (ROOT / ref).resolve()
+        if not ref or ROOT not in path.parents or not path.exists():
+            return JSONResponse({'error': 'video not found'}, status_code=400)
+        if path.suffix.lower() not in VIDEO_EXT:
+            return JSONResponse({'error': 'not a video file'},
+                                status_code=400)
+        try:
+            return bake.start(path, engine.mode, engine.device,
+                              engine.face_enabled)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({'error': str(exc)}, status_code=409)
+
+    @app.get('/api/bake')
+    async def bake_state(full: bool = False):
+        data = dict(bake.status())
+        if full and data['state'] == 'done':
+            data.update(bake.result() or {})
+        return data
+
+    @app.post('/api/bake/cancel')
+    async def bake_cancel():
+        return bake.cancel()
 
     @app.post('/api/vrma')
     async def upload_vrma(name: str, request: Request):
