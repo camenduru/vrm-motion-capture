@@ -276,7 +276,7 @@ class DemoSource:
 class PoseEngine:
 
     def __init__(self,
-                 source: str = 'camera:0',
+                 source: str = 'none',
                  mode: str = 'auto',
                  device: str = 'auto',
                  det_frequency: int = 6,
@@ -337,6 +337,10 @@ class PoseEngine:
         self._image = None
         self._pending_source: Optional[str] = None
         self._pending_device: Optional[str] = None
+        self._source_fps = 0.0
+        self._media_frame = 0
+        self._grab_request = False
+        self._grab_result = None
         self._frame_interval = 0.0
         self._frame_due = 0.0
         self._source_ready = False
@@ -447,6 +451,7 @@ class PoseEngine:
 
     def available_sources(self) -> list:
         items = [
+            {'id': 'none', 'label': 'None', 'kind': 'none'},
             {'id': 'camera:0', 'label': 'Webcam 0', 'kind': 'camera'},
             {'id': 'camera:1', 'label': 'Webcam 1', 'kind': 'camera'},
             {'id': 'camera:2', 'label': 'Webcam 2', 'kind': 'camera'},
@@ -467,7 +472,7 @@ class PoseEngine:
 
     def set_source(self, source: str) -> None:
         """Queue a different camera / demo clip / video for the engine."""
-        if source != 'demo' and not source.startswith('camera') \
+        if source not in ('none', 'demo') and not source.startswith('camera') \
                 and self.resolve_source(source) is None:
             raise ValueError(f'Unknown source: {source}')
         with self._lock:
@@ -499,6 +504,8 @@ class PoseEngine:
         self._demo = None
         self._frame_interval = 0.0
         self._frame_due = 0.0
+        self._source_fps = 0.0
+        self._media_frame = 0
         self._face_cache = None
         self._face_tick = 0
         if self._tracker is not None and hasattr(self._tracker, 'reset'):
@@ -508,6 +515,11 @@ class PoseEngine:
         """Open the current source and record its playback cadence."""
         self._close_source()
         self.is_demo = self.source == 'demo'
+
+        if self.source in ('none', ''):
+            # deliberately no input: the engine idles and serves the last frame
+            self._frame_interval = 0.0
+            return
 
         if self.is_demo:
             self._demo = DemoSource()
@@ -535,6 +547,7 @@ class PoseEngine:
             if self._image is None:
                 raise RuntimeError(f'Could not read image: {path}')
             self._frame_interval = 1.0 / 30.0
+            self._source_fps = 30.0
             return
 
         self._cap = cv2.VideoCapture(str(path))
@@ -542,6 +555,9 @@ class PoseEngine:
             raise RuntimeError(f'Could not open video: {path}')
         fps = self._cap.get(cv2.CAP_PROP_FPS)
         self._frame_interval = 1.0 / fps if 1 <= fps <= 120 else 1.0 / 30.0
+        # media time is reported with each pose so the browser can keep the
+        # clip's own audio track in sync with the frames it is showing
+        self._source_fps = fps if 1 <= fps <= 120 else 30.0
         print(f'[source] {path.name} @ {fps:.1f} fps', flush=True)
 
     # ------------------------------------------------------------------ loop
@@ -624,7 +640,8 @@ class PoseEngine:
                 try:
                     self._prepare_source()
                     self._source_ready = True
-                    if self.is_demo:
+                    if self.is_demo or self.source in ('none', ''):
+                        # nothing to track, but the engine is up and idle
                         self._set_status('running', None)
                 except Exception as exc:  # noqa: BLE001
                     # keep retrying, e.g. a camera that is busy right now
@@ -633,7 +650,8 @@ class PoseEngine:
                     time.sleep(2.0)
                     continue
 
-            if not self.is_demo and self._tracker is None:
+            if not self.is_demo and self.source not in ('none', '') \
+                    and self._tracker is None:
                 try:
                     self._ensure_tracker()
                     self._set_status('running', None)
@@ -643,14 +661,20 @@ class PoseEngine:
                     time.sleep(2.0)
                     continue
 
-            if not self.is_demo:
+            if not self.is_demo and self.source not in ('none', ''):
                 self._ensure_face()
 
             frame = self._next_frame()
             if frame is None:
-                if self._cap is not None:
-                    time.sleep(0.02)
+                # no source at all must not spin the loop
+                time.sleep(0.02 if self._cap is not None else 0.1)
                 continue
+
+            # hand a clean frame to a waiting /api/lipsync request
+            with self._lock:
+                if self._grab_request:
+                    self._grab_request = False
+                    self._grab_result = frame.copy()
 
             now = time.perf_counter()
             dt = max(1e-3, now - prev_t)
@@ -723,6 +747,8 @@ class PoseEngine:
                     'scores': np.round(scores, 4).tolist()
                     if scores is not None else [],
                     'face': face,
+                    'media_t': (round(self._media_frame / self._source_fps, 3)
+                                if self._source_fps else None),
                     'width': w,
                     'height': h,
                 }
@@ -769,7 +795,9 @@ class PoseEngine:
             # loop video files, ignore transient webcam failures
             if self._cap.get(cv2.CAP_PROP_FRAME_COUNT) > 1:
                 self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                self._media_frame = 0
             return None
+        self._media_frame += 1
         return cv2.flip(frame, 1)  # mirror for a natural "selfie" view
 
     @staticmethod
@@ -818,3 +846,27 @@ class PoseEngine:
     def pose(self) -> dict:
         with self._lock:
             return self._pose
+
+    def request_frame(self, timeout: float = 2.0):
+        """Hand back a clean copy of the next frame (no skeleton overlay)."""
+        with self._lock:
+            self._grab_result = None
+            self._grab_request = True
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                frame = self._grab_result
+                if frame is not None:
+                    self._grab_result = None
+                    return frame
+            time.sleep(0.02)
+        with self._lock:
+            self._grab_request = False
+        return None
+
+    def capture_to(self, path) -> bool:
+        """Write the live frame to `path` (used as a lip-sync identity)."""
+        frame = self.request_frame()
+        if frame is None:
+            return False
+        return bool(cv2.imwrite(str(path), frame))

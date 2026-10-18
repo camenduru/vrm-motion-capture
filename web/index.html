@@ -54,10 +54,22 @@
             <option value="cpu">cpu</option>
           </select>
         </label>
+        <label class="picker">
+          <span>lip sync</span>
+          <select id="lipsync-mode" aria-label="Lip sync drive method">
+            <option value="landmarks">face landmarks</option>
+            <option value="musetalk">musetalk (offline)</option>
+          </select>
+        </label>
         <input id="file-input" type="file" hidden
                accept="video/*,.mp4,.webm,.mov,.mkv,.m4v,.avi" />
         <button id="btn-upload" type="button">Add video…</button>
+        <button id="btn-generate" type="button">Generate VRMA…</button>
+        <button id="btn-load-vrma" type="button">Load VRMA…</button>
+        <input id="vrma-input" type="file" hidden accept=".vrma,.glb" />
+        <button id="btn-realtime" type="button">Start realtime drive</button>
         <button id="btn-reset" type="button">Reset view</button>
+        <button id="btn-sound" type="button" class="active">Sound</button>
         <button id="btn-feed" type="button" class="active">Feed</button>
         <button id="btn-fullscreen" type="button">Fullscreen</button>
       </div>
@@ -74,6 +86,10 @@
           <div class="progress"><span id="loader-bar"></span></div>
         </div>
       </div>
+
+      <!-- the pose stream is silent MJPEG; the clip's own audio track is
+           played here and nudged to follow the frame timestamp -->
+      <audio id="source-audio" loop preload="auto"></audio>
 
       <div class="toast" id="toast"></div>
     </div>

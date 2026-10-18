@@ -383,6 +383,15 @@ body {
   background: rgba(18, 24, 32, 0.85);
 }
 
+.actions button:disabled,
+.actions button:disabled:hover {
+  color: #4a5262;
+  border-color: var(--line);
+  background: var(--panel);
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 .actions button.active {
   color: var(--accent);
   border-color: rgba(98, 242, 210, 0.35);

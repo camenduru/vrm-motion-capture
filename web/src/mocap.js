@@ -121,6 +121,9 @@ export class MocapRetargeter {
       target: new THREE.Quaternion(),
       headW: 0,
       weights: Object.create(null),
+      // rolling "wide open" reference for this speaker, so the mouth opens
+      // fully at whatever jaw range the face/camera actually produces
+      mouthRef: 0.25,
       fresh: false,
     };
     this._faceNames = null;
@@ -518,6 +521,15 @@ export class MocapRetargeter {
     const s = (v) => (v <= 0.06 ? 0 : Math.min(1, (v - 0.06) / 0.94));
 
     const jaw = s(g('jawOpen'));
+    // MuseTalk clips peak around jawOpen 0.25 while a shouted webcam pose
+    // reaches 0.6; normalising against the speaker's own range keeps the mouth
+    // visibly moving instead of pinned shut or permanently wide
+    const jawRaw = g('jawOpen');
+    this.face.mouthRef += (jawRaw - this.face.mouthRef) *
+      (jawRaw > this.face.mouthRef ? 0.35 : 0.008);
+    this.face.mouthRef = clamp(this.face.mouthRef, 0.18, 0.7);
+    const open = clamp(
+      (jawRaw - 0.025) / (this.face.mouthRef * 0.75), 0, 1);
     const smile = s(avg('mouthSmileLeft', 'mouthSmileRight'));
     const frown = s(avg('mouthFrownLeft', 'mouthFrownRight'));
     const pucker = s(g('mouthPucker'));
@@ -531,9 +543,9 @@ export class MocapRetargeter {
 
     const targets = {
       blink: s(avg('eyeBlinkLeft', 'eyeBlinkRight')),
-      aa: jaw,
+      aa: open,
       ou: pucker,
-      oh: Math.min(1, jaw * funnel * 1.7 + funnel * 0.2),
+      oh: Math.min(1, open * funnel * 1.7 + funnel * 0.2),
       ee: stretch,
       // no direct ARKit source for a closed "ih" mouth, and deriving it from
       // the smile just double-drives `happy`, so it stays unused
@@ -625,6 +637,7 @@ export class MocapRetargeter {
     this.face.q.identity();
     this.face.target.identity();
     this.face.headW = 0;
+    this.face.mouthRef = 0.25;
     this.face.weights = Object.create(null);
     this.root.position.set(0, 0, 0);
   }

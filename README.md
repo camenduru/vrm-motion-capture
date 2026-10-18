@@ -59,9 +59,12 @@ start.bat --source camera:1 --mode balanced                    # second webcam, 
 
 | Control | What it does |
 | --- | --- |
-| **pose source** | switch between webcams, the synthetic demo, and every clip in `videos/` — without restarting |
+| **pose source** | `None` (default), webcams, the synthetic demo, and every clip in `videos/` - switched without restarting |
 | **compute** | rebuild the models on `auto` / `gpu (cuda)` / `cpu` without restarting; `auto` uses the accurate models on a GPU and the light ones on CPU |
 | **Add video…** | upload a clip (`.mp4 .webm .mov .mkv`, max 512 MB) — it is stored in `videos/` and used as the live pose source |
+| **Generate VRMA…** | bakes the current clip into a `.vrma`; with the lip-sync driver set to `musetalk (offline)` it runs MuseTalk first |
+| **Load VRMA…** | plays a `.vrma` file on the avatar (generated elsewhere or hand-made) |
+| **Start realtime drive** | toggles live landmark tracking on/off (off by default; disabled while MuseTalk is the driver) |
 | **Feed / Reset view / Fullscreen** | hide the pose preview, re-frame the avatar, go fullscreen |
 | left-drag / right-drag / scroll | orbit · slide the avatar around the frame · zoom |
 
@@ -78,7 +81,7 @@ pose fps and the active model preset.
 ```shell
 python -m app.server [options]
 
---source    camera:0 | demo | videos/<clip> | path/to/video-or-image   (default camera:0)
+--source    none | camera:0 | demo | videos/<clip> | path/to/video-or-image   (default none)
 --mode      auto | performance | balanced | lightweight   (default auto: performance on GPU, lightweight on CPU)
 --device    auto | cpu | cuda | mps         (default auto: CUDA when available)
 --det-frequency  N   run person detection every N frames (default 6)
@@ -163,6 +166,49 @@ Face inference costs ~9 ms a frame, so it runs every `--face-every` frames
 (default 2) and reuses the last result in between — that keeps a 30 fps source
 at 30 fps. `--no-face` turns the layer off completely.
 
+### VRM animation generation (MuseTalk v1.5)
+
+There are two distinct paths, and MuseTalk is **only** used by the offline one.
+
+**Realtime** — the **Start realtime drive** button (off by default) drives the
+avatar continuously from face landmarks. The status pill reads `tracking` while
+it follows the input and `paused` when it is off.
+
+**Offline** — **Generate VRMA…** bakes the current clip into a VRM Animation
+(`animations/<clip>.vrma`: a glTF binary with `VRMC_vrm_animation`, carrying
+every humanoid bone rotation and expression weight per frame). **Load VRMA…**
+plays any `.vrma` on the avatar. The **lip sync** dropdown chooses what drives
+the mouth while baking:
+
+| driver | what Generate VRMA… does |
+| --- | --- |
+| `face landmarks` | bakes straight from the clip's own face |
+| `musetalk (offline)` | runs MuseTalk v1.5 on the clip's audio first, then bakes its result |
+
+MuseTalk never runs on its own — selecting it only arms the offline driver, and
+the realtime button is disabled while it is armed. The baked animation replays
+against the clip's audio clock, so it needs no models or GPU. MuseTalk's face
+preprocessing is cached per identity; because it processes every identity frame
+(~0.5 s each), an identity video is capped at 900 frames.
+
+MuseTalk needs its own interpreter: this app runs Python 3.13 while MuseTalk's
+torch/diffusers stack lives on 3.10/3.11. One-time setup:
+
+```shell
+scripts\setup_musetalk.bat
+```
+
+It records the interpreter in `MuseTalk/.musetalk_python` and downloads the
+v1.5 weights (~4 GB) into `MuseTalk/models`. Point `MUSETALK_PYTHON` at a
+different interpreter if you keep one elsewhere. When MuseTalk or its weights
+are missing the option is disabled and its tooltip says why — the rest of the
+app is unaffected.
+
+A few local patches make the checkout work with current dependencies: no
+`mmpose`/`mmcv`/`mmdet` (the face crop box is computed from MediaPipe
+landmarks instead of DWPose), `np.int` → `int`, and `weights_only=False` for
+the legacy checkpoints under torch ≥ 2.6.
+
 ## API
 
 | endpoint | purpose |
@@ -173,6 +219,12 @@ at 30 fps. `--no-face` turns the layer off completely.
 | `GET /api/sources` | pickable pose sources |
 | `POST /api/source` | `{"source": "videos/clip.mp4"}` |
 | `POST /api/device` | `{"device": "auto" \| "cuda" \| "cpu"}` — rebuilds the models on that device |
+| `POST /api/audio` | raw audio body → saved in `audio/` for lip sync |
+| `GET /api/lipsync` | lip-sync job state + whether MuseTalk is installed |
+| `POST /api/lipsync` | `{"audio": "source", "face"?: "videos/clip.mp4"}` → starts a MuseTalk job (only used by Generate VRMA…) |
+| `POST /api/lipsync/cancel` | stop the running MuseTalk job |
+| `POST /api/animation?name=x.vrma` | bakes posted frames into `animations/x.vrma` |
+| `POST /api/vrma?name=x.vrma` | raw `.vrma` upload, served from `animations/` |
 | `POST /api/upload?name=clip.mp4` | raw video body → saved in `videos/` and selected |
 | `GET /api/avatar` | versioned URLs for the `.vrm` / `.vrma` files |
 | `WS /ws/pose` | keypoint stream: `{seq, t, fps, detected, keypoints[17][2], scores[17], width, height}` |

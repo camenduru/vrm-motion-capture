@@ -46,10 +46,17 @@ const toastEl = document.getElementById('toast');
 const btnReset = document.getElementById('btn-reset');
 const btnFeed = document.getElementById('btn-feed');
 const btnFull = document.getElementById('btn-fullscreen');
+const btnSound = document.getElementById('btn-sound');
+const sourceAudio = document.getElementById('source-audio');
 const sourceSelect = document.getElementById('source-select');
 const deviceSelect = document.getElementById('device-select');
 const btnUpload = document.getElementById('btn-upload');
+const btnGenerate = document.getElementById('btn-generate');
+const btnLoadVrma = document.getElementById('btn-load-vrma');
+const vrmaInput = document.getElementById('vrma-input');
+const btnRealtime = document.getElementById('btn-realtime');
 const fileInput = document.getElementById('file-input');
+const lipsyncMode = document.getElementById('lipsync-mode');
 
 /* --------------------------------------------------------------- scene */
 const renderer = new THREE.WebGLRenderer({
@@ -253,12 +260,22 @@ const state = {
   poseFps: 0,
   detected: false,
   mode: '—',
-  source: 'camera:0',
+  source: 'none',
+  lipsyncMode: 'landmarks',
   resolution: '',
   wsOpen: false,
   engineError: '',
   toastError: false,
   feedOn: true,
+  audioUrl: '',
+  soundOn: true,
+  recording: null,
+  animation: null,
+  animStart: 0,
+  liveDrive: false,
+  vrmaMixer: null,
+  uploadIntent: 'play',
+  lipJob: false,
 };
 
 let blinkExpression = null;
@@ -423,6 +440,10 @@ async function pollStatus() {
         sourceSelect.value = status.source;
       }
     }
+    if (status.audio_url !== state.audioUrl) {
+      state.audioUrl = status.audio_url || '';
+      applySourceAudio();
+    }
     const error = status.state === 'error' ? (status.error || 'Source unavailable') : '';
     state.engineError = error;
     if (error) showToast(error, { sticky: true, error: true });
@@ -462,6 +483,9 @@ async function switchSource(source) {
     }
     state.source = source;
     state.poseAt = 0;
+    // a new source means live tracking again; drop any baked playback/bake
+    state.animation = null;
+    state.recording = null;
     startFeed();
     return true;
   } catch (err) {
@@ -497,25 +521,37 @@ async function switchDevice(device) {
 
 deviceSelect.addEventListener('change', () => switchDevice(deviceSelect.value));
 
-btnUpload.addEventListener('click', () => fileInput.click());
+btnUpload.addEventListener('click', () => {
+  state.uploadIntent = 'play';
+  fileInput.click();
+});
 
 fileInput.addEventListener('change', async () => {
   const file = fileInput.files?.[0];
+  const intent = state.uploadIntent || 'play';
+  state.uploadIntent = 'play';
   if (!file) return;
+  const generate = intent === 'generate';
   showToast(`Uploading ${file.name}…`, { sticky: true });
   try {
     const response = await fetch(
-      `/api/upload?name=${encodeURIComponent(file.name)}`,
+      `/api/upload?name=${encodeURIComponent(file.name)}` +
+        (generate ? '&select=0' : ''),
       { method: 'POST', body: file },
     );
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
     await loadSources();
+    hideToast();
+    if (generate) {
+      // generating is offline: do not take over the live source
+      await startGenerate(data.source);
+      return;
+    }
     sourceSelect.value = data.source;
     state.source = data.source;
     state.poseAt = 0;
     startFeed();
-    hideToast();
     showToast(`Playing ${data.name} as live pose`);
   } catch (err) {
     showToast(`Upload failed: ${err.message}`, { sticky: true, error: true });
@@ -523,6 +559,210 @@ fileInput.addEventListener('change', async () => {
     fileInput.value = '';
   }
 });
+
+/* --------------------------------------------------------------- lip sync */
+let lipPollTimer = 0;
+
+lipsyncMode.addEventListener('change', () => setLipMode(lipsyncMode.value));
+
+function setLipMode(mode) {
+  const wanted = mode === 'musetalk' ? 'musetalk' : 'landmarks';
+  if (wanted === 'landmarks') {
+    stopLipSync();
+    state.lipsyncMode = 'landmarks';
+    showToast('Mouth driven by face landmarks');
+    return;
+  }
+
+  // MuseTalk is a purely offline driver: arming it needs no source and must
+  // not start a job or touch realtime tracking. Generate VRMA… is what runs it.
+  state.lipsyncMode = 'musetalk';
+  state.liveDrive = false;
+  syncRealtimeButton();
+  showToast('MuseTalk armed - press Generate VRMA… to bake');
+}
+
+/** Stop the running MuseTalk job; it saturates the GPU while it runs. */
+function stopLipSync() {
+  window.clearTimeout(lipPollTimer);
+  lipPollTimer = 0;
+  fetch('/api/lipsync/cancel', { method: 'POST' }).catch(() => {});
+}
+
+/**
+ * Offline: bake a VRM Animation from a video the user picks. With the lip-sync
+ * driver set to `musetalk`, MuseTalk re-drives the mouth first and its clip is
+ * what gets baked; with `face landmarks` the video is baked directly.
+ */
+btnGenerate.addEventListener('click', () => {
+  if (state.recording || state.lipJob) {
+    // stop early: keep whatever was captured so far
+    state.lipJob = false;
+    stopLipSync();
+    stopBake();
+    syncGenerateButton();
+    return;
+  }
+  state.uploadIntent = 'generate';
+  fileInput.click();
+});
+
+/** Generate VRMA doubles as the stop control while it is working. */
+function syncGenerateButton() {
+  const busy = !!state.recording || state.lipJob;
+  btnGenerate.classList.toggle('active', busy);
+  btnGenerate.textContent = busy ? 'Stop recording' : 'Generate VRMA…';
+  btnGenerate.title = busy
+    ? 'Stop now and keep what has been recorded'
+    : 'Pick a video and bake it into a .vrma';
+}
+
+async function startGenerate(source) {
+  if (!source || source === 'none' || source === 'demo' ||
+      source.startsWith('camera')) {
+    showToast('Pick a video first', { sticky: true, error: true });
+    return;
+  }
+  const stem = source.split('/').pop().replace(/\.[^.]+$/, '');
+
+  if (state.lipsyncMode === 'musetalk') {
+    // offline only: no realtime state, no source change, avatar stays idle
+    state.animation = null;
+    state.recording = null;
+    syncRealtimeButton();
+    showToast('MuseTalk: processing offline - no realtime tracking',
+      { sticky: true });
+    startLipSync(source, source);
+    return;
+  }
+
+  // the landmark bake records what the retargeter produces; tracking is
+  // driven by the recording itself, never by the realtime switch
+  showToast('Recording the VRMA from the video…', { sticky: true });
+  await switchSource(source);      // restart from the first frame
+  startBake(`${stem}.vrma`);
+}
+
+/**
+ * The realtime button is only meaningful for the landmark driver: MuseTalk is
+ * the offline path, so selecting it leaves this button inactive.
+ */
+function syncRealtimeButton() {
+  const recording = !!state.recording || state.lipJob;
+  const blocked = state.lipsyncMode === 'musetalk' || recording;
+  const live = !blocked && state.liveDrive && !state.animation &&
+    !state.vrmaMixer;
+  btnRealtime.disabled = blocked;
+  btnRealtime.title = state.lipsyncMode === 'musetalk'
+    ? 'MuseTalk is the offline driver - switch lip sync to face landmarks'
+    : (recording
+      ? 'Recording a VRMA - stop it first'
+      : (live ? 'Click to stop tracking the input'
+              : 'Drive the avatar live from face landmarks'));
+  btnRealtime.classList.toggle('active', live);
+  btnRealtime.textContent = live ? 'Realtime drive on' : 'Start realtime drive';
+}
+
+btnRealtime.addEventListener('click', () => {
+  if (state.lipsyncMode === 'musetalk') return;
+  if (state.liveDrive) {
+    // switch tracking off: the avatar stops following and eases to idle
+    state.liveDrive = false;
+    showToast('Tracking stopped');
+  } else {
+    state.liveDrive = true;
+    state.animation = null;
+    state.recording = null;
+    state.animStart = 0;
+    // hand the bones back from any loaded .vrma to the live retargeter
+    if (state.vrmaMixer) {
+      state.vrmaMixer.stopAllAction();
+      state.vrmaMixer = null;
+    }
+    showToast('Driving the avatar live from face landmarks');
+  }
+  syncRealtimeButton();
+});
+
+async function startLipSync(audioRef, faceRef) {
+  try {
+    const payload = { audio: audioRef };
+    if (faceRef) payload.face = faceRef;
+    const start = await fetch('/api/lipsync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const job = await start.json().catch(() => ({}));
+    if (!start.ok) throw new Error(job.error || `HTTP ${start.status}`);
+    state.lipJob = true;
+    showToast('MuseTalk: starting…', { sticky: true });
+    pollLipSync();
+  } catch (err) {
+    showToast(`Lip sync failed: ${err.message}`, { sticky: true, error: true });
+  }
+}
+
+async function pollLipSync() {
+  if (state.lipsyncMode !== 'musetalk') return;
+  let status;
+  try {
+    const response = await fetch('/api/lipsync', { cache: 'no-store' });
+    status = await response.json();
+  } catch {
+    lipPollTimer = window.setTimeout(pollLipSync, 2000);
+    return;
+  }
+  if (status.state === 'running') {
+    showToast(
+      `MuseTalk: ${status.phase || 'working'}… ${Math.round(status.elapsed || 0)}s`,
+      { sticky: true },
+    );
+    lipPollTimer = window.setTimeout(pollLipSync, 1500);
+    return;
+  }
+  if (status.state === 'error') {
+    state.lipJob = false;
+    showToast(`Lip sync failed: ${status.error}`,
+      { sticky: true, error: true });
+    return;
+  }
+  if (status.state === 'cancelled') {
+    state.lipJob = false;
+    showToast('MuseTalk stopped');
+    return;
+  }
+  if (status.state === 'done') {
+    state.lipJob = false;
+    showToast(`Lip synced clip ready: ${status.output}`);
+    await loadSources();
+    await switchSource(status.output);
+    lipsyncMode.value = 'musetalk';
+    // bake the VRM animation the clip produces so it can be replayed
+    const stem = status.output.split('/').pop().replace(/\.[^.]+$/, '');
+    startBake(`${stem}.vrma`);
+  }
+}
+
+async function checkLipSync() {
+  try {
+    const response = await fetch('/api/lipsync', { cache: 'no-store' });
+    const data = await response.json();
+    const ready = data.available && data.available.ok;
+    const option = lipsyncMode.querySelector('option[value="musetalk"]');
+    if (option) {
+      option.disabled = !ready;
+      option.textContent = ready ? 'musetalk' : 'musetalk (unavailable)';
+      option.title = ready ? '' : (data.available?.reason || '');
+    }
+    if (!ready && lipsyncMode.value === 'musetalk') {
+      lipsyncMode.value = 'landmarks';
+      state.lipsyncMode = 'landmarks';
+    }
+  } catch {
+    /* the server may still be starting */
+  }
+}
 
 /* ------------------------------------------------------------------ feed */
 function startFeed() {
@@ -561,6 +801,192 @@ btnFull.addEventListener('click', () => {
   }
 });
 
+/* --------------------------------------------------------------- load VRMA */
+/**
+ * Play a .vrma on the avatar with three-vrm-animation, exactly like the idle
+ * loop, so generated and hand-made animations behave the same.
+ */
+async function playVRMA(url) {
+  if (!state.vrm) throw new Error('avatar not loaded');
+  const gltf = await loadGLTF(
+    url,
+    (parser) => new VRMAnimationLoaderPlugin(parser),
+  );
+  const vrmAnimation = gltf.userData.vrmAnimations?.[0];
+  if (!vrmAnimation) throw new Error('not a VRM animation');
+
+  const clip = createVRMAnimationClip(vrmAnimation, state.vrm);
+  if (state.vrmaMixer) state.vrmaMixer.stopAllAction();
+  const mixer = new THREE.AnimationMixer(state.vrm.scene);
+  mixer.clipAction(clip).play();
+  state.vrmaMixer = mixer;
+  // replay takes over from live tracking / baked JSON playback
+  state.animation = null;
+  state.recording = null;
+  state.liveDrive = false;
+  syncRealtimeButton();
+  return clip;
+}
+
+btnLoadVrma.addEventListener('click', () => vrmaInput.click());
+
+vrmaInput.addEventListener('change', async () => {
+  const file = vrmaInput.files?.[0];
+  vrmaInput.value = '';
+  if (!file) return;
+  showToast(`Loading ${file.name}…`, { sticky: true });
+  try {
+    const upload = await fetch(
+      `/api/vrma?name=${encodeURIComponent(file.name)}`,
+      { method: 'POST', body: file },
+    );
+    const data = await upload.json().catch(() => ({}));
+    if (!upload.ok) throw new Error(data.error || `HTTP ${upload.status}`);
+    await playVRMA(data.animation);
+    showToast(`Playing ${file.name}`);
+  } catch (err) {
+    showToast(`Could not load VRMA: ${err.message}`,
+      { sticky: true, error: true });
+  }
+});
+
+/* ------------------------------------------------------- animation baking */
+const ANIM_EXPRESSIONS = [
+  'happy', 'angry', 'sad', 'relaxed', 'surprised',
+  'aa', 'ih', 'ou', 'ee', 'oh', 'blink', 'blinkLeft', 'blinkRight',
+];
+
+/** Snapshot the avatar's pose so it can be replayed without any model. */
+function captureFrame(t) {
+  const rt = state.retargeter;
+  const em = state.vrm && state.vrm.expressionManager;
+  if (!rt || !em) return null;
+
+  const bones = {};
+  for (const [name, bone] of Object.entries(rt.b)) {
+    if (!bone) continue;
+    const q = bone.quaternion;
+    bones[name] = [
+      Math.round(q.x * 1e4) / 1e4,
+      Math.round(q.y * 1e4) / 1e4,
+      Math.round(q.z * 1e4) / 1e4,
+      Math.round(q.w * 1e4) / 1e4,
+    ];
+  }
+  const expr = {};
+  for (const name of ANIM_EXPRESSIONS) {
+    const value = em.getValue(name);
+    if (value > 0.001) expr[name] = Math.round(value * 1000) / 1000;
+  }
+  return { t: Math.round(t * 1000) / 1000, bones, expr };
+}
+
+/** Bake the pose stream that a clip is producing into a stored animation. */
+function startBake(name) {
+  state.animation = null;
+  state.recording = { name, frames: [], seq: -1, last: -1 };
+  syncGenerateButton();
+  showToast('Recording the VRMA… press Stop recording to finish early',
+    { sticky: true });
+}
+
+function stopBake() {
+  const rec = state.recording;
+  state.recording = null;
+  syncGenerateButton();
+  if (!rec) return;
+  if (rec.frames.length < 2) {
+    showToast('Stopped before anything was recorded');
+    return;
+  }
+
+  const anim = {
+    fps: rec.frames.length / Math.max(0.001, rec.frames[rec.frames.length - 1].t),
+    duration: rec.frames[rec.frames.length - 1].t,
+    frames: rec.frames,
+  };
+  fetch(`/api/animation?name=${encodeURIComponent(rec.name)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(anim),
+  })
+    .then((response) => response.json())
+    .then((data) => {
+      state.animation = anim;
+      state.animStart = performance.now() / 1000;
+      syncGenerateButton();
+      showToast(`VRMA saved: ${data.animation}`);
+    })
+    .catch(() => showToast('Could not save the animation', { error: true }));
+}
+
+function applyAnimation(anim, t) {
+  const frames = anim.frames;
+  if (!frames || frames.length < 2) return;
+  const duration = frames[frames.length - 1].t || 1;
+  const tt = ((t % duration) + duration) % duration;
+
+  // frames are sorted by time; walk from the middle
+  let lo = 0;
+  let hi = frames.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (frames[mid].t < tt) lo = mid + 1;
+    else hi = mid;
+  }
+  const frame = frames[Math.max(0, lo)];
+
+  const rt = state.retargeter;
+  if (rt) {
+    for (const [name, q] of Object.entries(frame.bones)) {
+      const bone = rt.b[name];
+      if (bone) bone.quaternion.set(q[0], q[1], q[2], q[3]);
+    }
+  }
+  const em = state.vrm && state.vrm.expressionManager;
+  if (em) {
+    for (const name of ANIM_EXPRESSIONS) {
+      em.setValue(name, frame.expr[name] || 0);
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ sound */
+/** Play the source clip's audio track; the pose stream itself is silent. */
+function applySourceAudio() {
+  btnSound.disabled = !state.audioUrl;
+  if (!state.audioUrl) {
+    sourceAudio.pause();
+    sourceAudio.removeAttribute('src');
+    sourceAudio.load();
+    return;
+  }
+  if (sourceAudio.getAttribute('src') !== state.audioUrl) {
+    sourceAudio.src = state.audioUrl;
+    sourceAudio.currentTime = 0;
+  }
+  sourceAudio.muted = !state.soundOn;
+  if (state.soundOn) {
+    sourceAudio.play().catch(() => {
+      // autoplay policy: needs a gesture, which the Sound button provides
+      state.soundOn = false;
+      btnSound.classList.remove('active');
+      showToast('Click Sound to hear the clip');
+    });
+  }
+}
+
+btnSound.addEventListener('click', () => {
+  state.soundOn = !state.soundOn;
+  btnSound.classList.toggle('active', state.soundOn);
+  sourceAudio.muted = !state.soundOn;
+  if (state.soundOn && state.audioUrl) {
+    sourceAudio.play().catch(() => {
+      showToast('Could not start audio', { error: true });
+    });
+  }
+});
+
 /* ------------------------------------------------------------------ hud */
 let hudAccum = 0;
 function updateHud(dt, renderFps) {
@@ -569,9 +995,12 @@ function updateHud(dt, renderFps) {
   hudAccum = 0;
 
   const fresh = state.pose && performance.now() - state.poseAt < 800;
-  const tracking = fresh && state.detected;
+  // the pill reports what the avatar is doing, not what the camera sees
+  const driving = state.liveDrive && !state.animation && !state.recording &&
+    !state.lipJob;
+  const tracking = driving && fresh && state.detected;
   // the face layer can be locked on while the body is out of frame (close-up)
-  const faceLive = fresh && !!(state.pose && state.pose.face &&
+  const faceLive = driving && fresh && !!(state.pose && state.pose.face &&
     state.pose.face.blend);
   statusPill.classList.toggle('live', tracking || faceLive);
   statusPill.classList.toggle('offline', !!state.engineError || !state.wsOpen);
@@ -580,6 +1009,12 @@ function updateHud(dt, renderFps) {
     statusText.textContent = 'camera offline';
   } else if (!state.wsOpen) {
     statusText.textContent = 'reconnecting';
+  } else if (state.recording || state.lipJob) {
+    statusText.textContent = 'recording';
+  } else if (state.animation || state.vrmaMixer) {
+    statusText.textContent = 'replay';
+  } else if (!state.liveDrive) {
+    statusText.textContent = 'paused';
   } else if (tracking) {
     statusText.textContent = 'tracking';
   } else if (faceLive) {
@@ -597,8 +1032,11 @@ function updateHud(dt, renderFps) {
     .filter(Boolean)
     .join(' · ');
 
-  if (!fresh) blob.material.opacity = 0.35;
+  if (!fresh || !driving) blob.material.opacity = 0.35;
   else blob.material.opacity = 1;
+
+  syncRealtimeButton();
+  syncGenerateButton();
 }
 
 /* ------------------------------------------------------------------ loop */
@@ -613,14 +1051,49 @@ function animate(now) {
   elapsed += dt;
   renderFps += (1 / dt - renderFps) * 0.06;
 
-  if (state.mixer) state.mixer.update(dt);
+  if (state.vrmaMixer) state.vrmaMixer.update(dt);
+  else if (state.mixer) state.mixer.update(dt);
 
   const fresh = state.pose && performance.now() - state.poseAt < 800;
-  if (state.retargeter) {
-    state.retargeter.update(fresh ? state.pose : null, dt);
+  if (state.animation) {
+    // baked clip: drive the avatar from recorded data + the audio clock
+    const t = (state.audioUrl && !sourceAudio.paused)
+      ? sourceAudio.currentTime
+      : (performance.now() / 1000 - state.animStart);
+    applyAnimation(state.animation, t);
+  } else if (state.retargeter) {
+    // a recording needs the retargeter even when realtime drive is off, so
+    // Generate VRMA never has to touch the realtime switch
+    const drive = state.liveDrive || !!state.recording;
+    state.retargeter.update(drive && fresh ? state.pose : null, dt);
   }
 
-  updateBlink(dt);
+  // bake one sample per new pose while a clip is being recorded
+  if (state.recording && state.pose &&
+      state.pose.seq !== state.recording.seq) {
+    state.recording.seq = state.pose.seq;
+    const mediaT = state.pose.media_t;
+    if (typeof mediaT === 'number') {
+      if (state.recording.last >= 0 && mediaT < state.recording.last - 1e-3) {
+        stopBake();                 // the clip looped; one pass is enough
+      } else {
+        state.recording.last = mediaT;
+        const frame = captureFrame(mediaT);
+        if (frame) state.recording.frames.push(frame);
+      }
+    }
+  }
+
+  if (!state.animation && !state.recording) updateBlink(dt);
+
+  // keep the clip's own audio aligned with the frames the engine is showing
+  const mediaT = state.pose && state.pose.media_t;
+  if (state.audioUrl && !sourceAudio.paused &&
+      typeof mediaT === 'number' &&
+      performance.now() - state.poseAt < 600 &&
+      Math.abs(sourceAudio.currentTime - mediaT) > 0.3) {
+    sourceAudio.currentTime = Math.max(0, mediaT);
+  }
 
   if (state.vrm) state.vrm.update(dt);
 
@@ -671,5 +1144,6 @@ requestAnimationFrame(animate);
   connect();
   loadSources();
   pollStatus();
+  checkLipSync();
   window.setInterval(pollStatus, 3000);
 })();

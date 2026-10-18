@@ -4,7 +4,7 @@ Serves the built three.js frontend, the VRM avatar assets, an MJPEG pose
 preview stream and a websocket that pushes COCO-17 keypoints at camera rate.
 
 Run:
-    python -m app.server                 # webcam 0, GPU if available
+    python -m app.server                 # starts idle; pick a pose source in the UI
     python -m app.server --source demo   # synthetic skeleton, no camera
 """
 
@@ -12,7 +12,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import json
+import os
 import re
+import shutil
+import tempfile
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -22,12 +28,16 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .pose_engine import COCO_KEYPOINTS, VIDEO_EXT, PoseEngine
+from . import lipsync, vrma
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIST = ROOT / 'web' / 'dist'
 VRM_DIR = ROOT / 'vrm_models'
 VIDEOS_DIR = ROOT / 'videos'
+AUDIO_DIR = ROOT / 'audio'
+ANIM_DIR = ROOT / 'animations'
 UPLOAD_LIMIT = 512 * 1024 * 1024
+AUDIO_EXT = {'.wav', '.mp3', '.m4a', '.aac', '.ogg', '.flac', '.opus'}
 
 engine: PoseEngine | None = None
 _boundary = 'frame'
@@ -46,6 +56,7 @@ def create_app(pose_engine: PoseEngine) -> FastAPI:
             engine.stop()
 
     app = FastAPI(title='VRM Motion Capture', lifespan=lifespan)
+    lip_sync = lipsync.LipSyncJob()
 
     @app.middleware('http')
     async def revalidate_avatar_assets(request, call_next):
@@ -57,10 +68,16 @@ def create_app(pose_engine: PoseEngine) -> FastAPI:
 
     @app.get('/api/status')
     async def status():
-        return {
-            **engine.status(),
-            'keypoint_names': COCO_KEYPOINTS,
-        }
+        data = dict(engine.status())
+        # a video source carries its own audio; expose it so the page can play
+        # it in sync with the frames (the MJPEG preview is silent)
+        path = engine.resolve_source(engine.source)
+        data['audio_url'] = (
+            f'/videos/{path.name}'
+            if path is not None and path.parent == VIDEOS_DIR.resolve()
+            else '')
+        data['keypoint_names'] = COCO_KEYPOINTS
+        return data
 
     @app.get('/api/avatar')
     async def avatar():
@@ -88,8 +105,12 @@ def create_app(pose_engine: PoseEngine) -> FastAPI:
         }
 
     @app.post('/api/upload')
-    async def upload(name: str, request: Request):
-        """Save an uploaded clip into videos/ and switch to it."""
+    async def upload(name: str, request: Request, select: bool = True):
+        """Save an uploaded clip into videos/ and optionally switch to it.
+
+        Byte-identical content reuses the file already stored instead of
+        piling up ``_1``/``_2`` copies every time the same clip is added.
+        """
         clean = re.sub(r'[^A-Za-z0-9._ -]+', '_', Path(name).name).strip(' .')
         if not clean or Path(clean).suffix.lower() not in VIDEO_EXT:
             return JSONResponse(
@@ -97,41 +118,69 @@ def create_app(pose_engine: PoseEngine) -> FastAPI:
                           ', '.join(sorted(VIDEO_EXT))},
                 status_code=400)
 
+        # stream to scratch space (out of the project) while hashing
         VIDEOS_DIR.mkdir(exist_ok=True)
+        tmp = Path(tempfile.gettempdir()) / \
+            f'upload_{os.getpid()}_{int(time.time() * 1000)}.part'
+        digest = hashlib.sha256()
+        written = 0
+        try:
+            with open(tmp, 'wb') as handle:
+                async for chunk in request.stream():
+                    written += len(chunk)
+                    if written > UPLOAD_LIMIT:
+                        raise ValueError('too large')
+                    digest.update(chunk)
+                    handle.write(chunk)
+        except ValueError:
+            tmp.unlink(missing_ok=True)
+            return JSONResponse(
+                {'error': f'File is larger than '
+                          f'{UPLOAD_LIMIT // (1024 * 1024)} MB'},
+                status_code=413)
+        except Exception:  # noqa: BLE001
+            tmp.unlink(missing_ok=True)
+            raise
+
+        if written == 0:
+            tmp.unlink(missing_ok=True)
+            return JSONResponse({'error': 'Empty upload'}, status_code=400)
+
+        wanted = digest.hexdigest()
+
+        def same_content(path: Path) -> bool:
+            if not path.is_file() or path.stat().st_size != written:
+                return False
+            hasher = hashlib.sha256()
+            with open(path, 'rb') as source_file:
+                for block in iter(lambda: source_file.read(1 << 20), b''):
+                    hasher.update(block)
+            return hasher.hexdigest() == wanted
+
+        for existing in sorted(VIDEOS_DIR.iterdir()):
+            if existing.suffix.lower() in VIDEO_EXT and same_content(existing):
+                tmp.unlink(missing_ok=True)
+                source = f'videos/{existing.name}'
+                if select:
+                    engine.set_source(source)
+                print(f'[upload] reusing {existing.name}', flush=True)
+                return {'source': source, 'name': existing.name,
+                        'bytes': written, 'selected': select, 'reused': True}
+
         destination = VIDEOS_DIR / clean
         index = 1
         while destination.exists():
             destination = VIDEOS_DIR / f'{Path(clean).stem}_{index}' \
                 f'{Path(clean).suffix}'
             index += 1
-
-        written = 0
-        try:
-            with open(destination, 'wb') as handle:
-                async for chunk in request.stream():
-                    written += len(chunk)
-                    if written > UPLOAD_LIMIT:
-                        raise ValueError('too large')
-                    handle.write(chunk)
-        except ValueError:
-            destination.unlink(missing_ok=True)
-            return JSONResponse(
-                {'error': f'File is larger than '
-                          f'{UPLOAD_LIMIT // (1024 * 1024)} MB'},
-                status_code=413)
-        except Exception:  # noqa: BLE001
-            destination.unlink(missing_ok=True)
-            raise
-
-        if written == 0:
-            destination.unlink(missing_ok=True)
-            return JSONResponse({'error': 'Empty upload'}, status_code=400)
+        shutil.move(str(tmp), str(destination))
 
         source = f'videos/{destination.name}'
-        engine.set_source(source)
+        if select:
+            engine.set_source(source)
         print(f'[upload] {destination.name} ({written / 1e6:.1f} MB)', flush=True)
         return {'source': source, 'name': destination.name,
-                'bytes': written}
+                'bytes': written, 'selected': select}
 
     @app.get('/api/sources')
     async def sources():
@@ -157,6 +206,164 @@ def create_app(pose_engine: PoseEngine) -> FastAPI:
         except ValueError as exc:
             return JSONResponse({'error': str(exc)}, status_code=400)
         return {'device': device, 'state': 'switching'}
+
+    # ------------------------------------------------------------------ lip sync
+    @app.post('/api/audio')
+    async def upload_audio(name: str, request: Request):
+        """Save an uploaded clip into audio/ for the lip-sync job."""
+        clean = re.sub(r'[^A-Za-z0-9._ -]+', '_', Path(name).name).strip(' .')
+        if not clean or Path(clean).suffix.lower() not in AUDIO_EXT:
+            return JSONResponse(
+                {'error': 'Unsupported audio. Use ' +
+                          ', '.join(sorted(AUDIO_EXT))},
+                status_code=400)
+
+        AUDIO_DIR.mkdir(exist_ok=True)
+        destination = AUDIO_DIR / clean
+        index = 1
+        while destination.exists():
+            destination = AUDIO_DIR / f'{Path(clean).stem}_{index}' \
+                f'{Path(clean).suffix}'
+            index += 1
+
+        written = 0
+        try:
+            with open(destination, 'wb') as handle:
+                async for chunk in request.stream():
+                    written += len(chunk)
+                    if written > UPLOAD_LIMIT:
+                        raise ValueError('too large')
+                    handle.write(chunk)
+        except ValueError:
+            destination.unlink(missing_ok=True)
+            return JSONResponse(
+                {'error': f'Audio is larger than '
+                          f'{UPLOAD_LIMIT // (1024 * 1024)} MB'},
+                status_code=413)
+        except Exception:  # noqa: BLE001
+            destination.unlink(missing_ok=True)
+            raise
+
+        if written == 0:
+            destination.unlink(missing_ok=True)
+            return JSONResponse({'error': 'Empty upload'}, status_code=400)
+        return {'audio': f'audio/{destination.name}', 'bytes': written}
+
+    @app.get('/api/lipsync')
+    async def lipsync_state():
+        return {**lip_sync.status(), 'available': lipsync.availability()}
+
+    @app.post('/api/lipsync/cancel')
+    async def lipsync_cancel():
+        return lip_sync.cancel()
+
+    @app.post('/api/vrma')
+    async def upload_vrma(name: str, request: Request):
+        """Store a .vrma the user picked (already a VRM Animation)."""
+        clean = re.sub(r'[^A-Za-z0-9._-]+', '_', Path(name).name).strip(' .')
+        if not clean:
+            return JSONResponse({'error': 'bad name'}, status_code=400)
+        if not clean.lower().endswith('.vrma'):
+            clean += '.vrma'
+        body = await request.body()
+        if not body:
+            return JSONResponse({'error': 'empty file'}, status_code=400)
+        ANIM_DIR.mkdir(exist_ok=True)
+        (ANIM_DIR / clean).write_bytes(body)
+        print(f'[anim] loaded {clean} ({len(body) / 1e3:.0f} kB)', flush=True)
+        return {'animation': f'/animations/{clean}', 'bytes': len(body)}
+
+    @app.post('/api/animation')
+    async def save_animation(name: str, request: Request):
+        """Store a baked VRM animation as .vrma (or raw .json)."""
+        clean = re.sub(r'[^A-Za-z0-9._-]+', '_', Path(name).name).strip(' .')
+        if not clean:
+            return JSONResponse({'error': 'bad name'}, status_code=400)
+        body = await request.body()
+        if not body:
+            return JSONResponse({'error': 'empty body'}, status_code=400)
+        ANIM_DIR.mkdir(exist_ok=True)
+
+        if clean.lower().endswith('.vrma'):
+            try:
+                data = json.loads(body.decode('utf-8'))
+                info = vrma.write_vrma(ANIM_DIR / clean, data)
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse({'error': str(exc)}, status_code=400)
+            print(f'[anim] saved {clean} ({info["bytes"] / 1e3:.0f} kB, '
+                  f'{info["bones"]} bones, {info["expressions"]} expressions)',
+                  flush=True)
+            return {'animation': f'/animations/{clean}', **info}
+
+        if not clean.lower().endswith('.json'):
+            clean += '.json'
+        destination = ANIM_DIR / clean
+        destination.write_bytes(body)
+        print(f'[anim] saved {clean} ({len(body) / 1e3:.0f} kB)', flush=True)
+        return {'animation': f'/animations/{clean}', 'bytes': len(body)}
+
+    @app.post('/api/lipsync')
+    async def lipsync_start(payload: dict):
+        audio_ref = str(payload.get('audio', '')).strip()
+        face_ref = str(payload.get('face', '')).strip()
+        from_source = audio_ref in ('', 'source')
+
+        if lip_sync.busy():
+            return JSONResponse(
+                {'error': 'a lip-sync job is already running'},
+                status_code=409)
+        # scratch space only: nothing from this job lands in the project
+        lipsync.reset_work()
+
+        if from_source:
+            # "source audio": use the audio track of the clip being played
+            source_path = pose_engine.resolve_source(pose_engine.source)
+            if source_path is None or source_path.suffix.lower() in \
+                    {'.png', '.jpg', '.jpeg', '.bmp', '.webp'}:
+                return JSONResponse(
+                    {'error': 'the pose source has no audio track - use a '
+                              'video, or upload an audio file'},
+                    status_code=400)
+            try:
+                audio = lipsync.extract_source_audio(source_path)
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse({'error': str(exc)}, status_code=400)
+        else:
+            audio = (ROOT / audio_ref).resolve()
+            if ROOT not in audio.parents or not audio.exists():
+                return JSONResponse({'error': 'audio file not found'},
+                                    status_code=400)
+
+        if face_ref:
+            face = (ROOT / face_ref).resolve()
+            if ROOT not in face.parents or not face.exists():
+                return JSONResponse({'error': 'face image not found'},
+                                    status_code=400)
+            if face.suffix.lower() not in lipsync.IMAGE_EXT:
+                # a video identity: trim it to the cap, and if that happened
+                # the trimmed clip (which carries the audio) is used for both
+                try:
+                    face, audio = lipsync.fit_identity(face, audio)
+                except Exception as exc:  # noqa: BLE001
+                    return JSONResponse({'error': str(exc)}, status_code=400)
+        else:
+            face = lipsync.work_path(f'face_{int(time.time())}.png')
+            if not pose_engine.capture_to(face):
+                return JSONResponse(
+                    {'error': 'no live frame to use as the face - select a '
+                              'pose source first, or pass a face image'},
+                    status_code=409)
+            # MuseTalk needs an actual face; say so instead of failing later
+            if not (pose_engine.pose() or {}).get('face'):
+                return JSONResponse(
+                    {'error': 'no face in the captured frame - face the '
+                              'camera, or pass a face image'},
+                    status_code=409)
+
+        try:
+            return lip_sync.start(audio, face)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({'error': str(exc)}, status_code=400)
 
     @app.get('/video')
     async def video():
@@ -203,6 +410,9 @@ def create_app(pose_engine: PoseEngine) -> FastAPI:
             return
 
     app.mount('/vrm', StaticFiles(directory=VRM_DIR), name='vrm')
+    app.mount('/videos', StaticFiles(directory=VIDEOS_DIR), name='videos')
+    ANIM_DIR.mkdir(exist_ok=True)
+    app.mount('/animations', StaticFiles(directory=ANIM_DIR), name='animations')
 
     assets = WEB_DIST / 'assets'
     if assets.exists():
@@ -230,8 +440,8 @@ def create_app(pose_engine: PoseEngine) -> FastAPI:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='VRM webcam motion capture')
-    parser.add_argument('--source', default='camera:0',
-                        help='camera:0, demo, a clip from videos/, or any '
+    parser.add_argument('--source', default='none',
+                        help='none, camera:0, demo, a clip from videos/, or any '
                              'video/image path')
     parser.add_argument('--mode', default='auto',
                         choices=['auto', 'performance', 'balanced',
