@@ -64,9 +64,10 @@ start.bat --source camera:1 --mode balanced                    # second webcam, 
 | **pose source** | `None` (default), webcams, the synthetic demo, and every clip in `videos/` - switched without restarting |
 | **compute** | rebuild the models on `auto` / `gpu (cuda)` / `cpu` without restarting; `auto` uses the accurate models on a GPU and the light ones on CPU |
 | **Add video…** | upload a clip (`.mp4 .webm .mov .mkv`, max 512 MB) — it is stored in `videos/` and used as the live pose source |
-| **Generate VRMA…** | bakes the current clip into a `.vrma`; with the lip-sync driver set to `musetalk (offline)` it runs MuseTalk first |
+| **Generate VRMA…** | bakes the current clip into a `.vrma`; the **generate with** picker chooses the 2D tracker, FlowHMR or ExMR, and with the lip-sync driver set to `musetalk (offline)` it runs MuseTalk first |
 | **Load VRMA…** | plays a `.vrma` file on the avatar (generated elsewhere or hand-made) |
 | **Start realtime drive** | toggles live landmark tracking on/off (off by default; disabled while MuseTalk is the driver) |
+| **Face tracker** | runs MediaPipe face tracking in the browser and drives the full VRM face — expressions, per-eye blink, gaze and head pose — from the same camera or clip |
 | **Feed / Reset view / Fullscreen** | hide the pose preview, re-frame the avatar, go fullscreen |
 | left-drag / right-drag / scroll | orbit · slide the avatar around the frame · zoom |
 
@@ -168,6 +169,49 @@ Face inference costs ~9 ms a frame, so it runs every `--face-every` frames
 (default 2) and reuses the last result in between — that keeps a 30 fps source
 at 30 fps. `--no-face` turns the layer off completely.
 
+### Realtime browser face tracker (from the GNM webcam puppet)
+
+**Face tracker** in the actions panel runs a second, independent face layer
+entirely in the browser. It is the tracking half of
+[`gnm-webcam-puppet`](gnm-webcam-puppet) — MediaPipe's 478 landmarks, 52 ARKit
+blendshape scores and the 4×4 head pose — converted to drive **the whole VRM
+face** rather than the GNM parametric head:
+
+| tracker output | VRM face channel |
+| --- | --- |
+| 52 ARKit scores | the 11 expression presets (`aa ih ou ee oh happy angry sad relaxed surprised` + blink) |
+| `eyeBlinkLeft` / `eyeBlinkRight` | `blinkLeft` / `blinkRight` separately, so a wink survives |
+| 478 landmarks + iris rings | gaze → `vrm.lookAt` target, or the `lookUp/Down/Left/Right` presets on a rig-less avatar |
+| 4×4 facial transform | the head bone quaternion, in world space on top of its rest pose |
+
+Two design choices make it coexist with the existing pipeline:
+
+* **It reads the server's MJPEG preview**, not a camera of its own. The Python
+  pose engine already owns the webcam, and the preview is mirrored exactly like
+  the frames the server's face layer sees — so the browser tracker also works
+  when the pose source is an uploaded clip instead of a live camera.
+* **It sits above the server face layer only while it has a lock.** `face.js`
+  is a thin wrapper around MediaPipe Tasks Vision; the conversion lives in
+  `face-retarget.js` with no SDK and no three.js, so `npm test` checks the
+  mapping, gaze maths and head-pose extraction without a camera. When the face
+  is lost the override expires after 700 ms and expressions ease back to rest.
+
+The runtime is vendored into `web/public/` (gitignored) by
+`npm run sync-face-assets`, which also copies the same
+`models/face_landmarker.task` the Python layer uses. `npm run dev` and
+`npm run build` run it automatically.
+
+```shell
+cd web && npm install
+npm run sync-face-assets   # once, or whenever the MediaPipe package changes
+npm run dev
+```
+
+Select a camera or a clip, then press **Face tracker**. The status pill reads
+**face tracker** while it is locked; the `face` stat shows its rate. Body
+tracking is untouched — a close-up with no shoulders in frame still animates
+the face and head.
+
 ### VRM animation generation (MuseTalk v1.5)
 
 There are two distinct paths, and MuseTalk is **only** used by the offline one.
@@ -210,6 +254,114 @@ A few local patches make the checkout work with current dependencies: no
 `mmpose`/`mmcv`/`mmdet` (the face crop box is computed from MediaPipe
 landmarks instead of DWPose), `np.int` → `int`, and `weights_only=False` for
 the legacy checkpoints under torch ≥ 2.6.
+
+### FlowHMR (3D motion from video)
+
+The **generate with** picker switches the offline generator. `rtmpose (2d)` is
+the default path described above — 17 keypoints from the video, depth guessed
+from limb foreshortening. `flowhmr (3d)` runs
+[FlowHMR](https://github.com/flowhmr/flowhmr) over the same clip instead: it
+detects the person, estimates camera motion, extracts body features and
+generates **SMPL-H motion** (`poses (T, 52, 3)`, `trans (T, 3)`), so every bone
+direction in the bake is measured in 3D rather than inferred.
+
+FlowHMR is a separate environment (Python 3.10 + its own torch stack, plus
+YOLOX, VGGT-Omega, SAM 3D Body and the SMPL-H body model - the last three are
+gated downloads you have to request). `flowhmr/docs/install.md` has the full
+list; the short version, from `flowhmr/`:
+
+```shell
+git submodule update --init --recursive
+py -3.10 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt -r tools\web\requirements.txt
+.venv\Scripts\python.exe -m pip install --no-build-isolation --no-deps -e third_party\YOLOX
+```
+
+Public checkpoints: `yolox_l.pth` (YOLOX release) and
+`fafsaf1/flowhmr-0.46B` (`checkpoints/flowhmr_latest/`). Gated ones, after
+accepting their licenses and with an `hf` token:
+`facebook/VGGT-Omega` (`ckpts/vggt-omega/`) and
+`facebook/sam-3d-body-dinov3` (`ckpts/sam-3d-body-dinov3/`). The SMPL-H neutral
+model is a manual download from [MANO](https://mano.is.tue.mpg.de/) and belongs
+at `assets/body_models/smplh/neutral/model.npz`; the joint regressor is the
+public GVHMR asset.
+
+The app finds `<flowhmr>/.venv/Scripts/python.exe` on its own, or an
+interpreter written to `flowhmr/.flowhmr_python`:
+
+```shell
+set FLOWHMR_PYTHON=C:\path\to\flowhmr\.venv\Scripts\python.exe
+set FLOWHMR_DIR=C:\Users\PC\Documents\rtmlib\flowhmr      # default: ./flowhmr
+```
+
+`FLOWHMR_CKPT` overrides the checkpoint (default
+`checkpoints/flowhmr_latest/flowhmr_latest.ckpt`).
+
+A bake runs the pipeline as a subprocess (`run_v2m_demo_generation.py
+--postprocess`), polls its stage (`reading → detecting → camera → features →
+generating`), then reads the npz and hands the browser 22 body joints per
+frame. The browser
+retargets them exactly as it retargets keypoints — same `aim` solver, same VRMA
+writer — so a FlowHMR bake and a 2D bake are the same kind of artefact.
+
+Differences worth knowing:
+
+* **No face.** FlowHMR predicts body motion only, so a FlowHMR bake has no
+  expressions or head pose, and the lip-sync driver does not apply to it.
+* **The person's frame is measured, not assumed.** The rig is aimed in the
+  person's own body frame (up = hips → shoulders, right = left → right
+  shoulder), mapped so the person's right hand drives the avatar's left. A clip
+  that turns around turns the avatar, and the npz's axis convention does not
+  matter.
+* **Root translation is not baked.** The avatar walks in place: `.vrma` carries
+  bone rotations, and `captureFrame` does not store the root position (the 2D
+  path has the same limit).
+* Feature extraction is cached per video stem in `flowhmr/output/<stem>/`, and
+  recomputed with `--overwrite` when the clip is newer than any of its caches.
+* A run takes minutes per clip on a GPU and there is no CPU fallback worth
+  waiting for; the button turns into **Stop** while it runs.
+* **3d camera detail** sets how often VGGT-Omega runs. Every frame is the most
+  accurate and peaks near 30 GB of VRAM; every 10th frame (the default, camera
+  interpolated in between) is what fits a 24 GB card.
+
+When FlowHMR, its interpreter or its checkpoints are missing, the picker
+itself reads **flowhmr (3d) - not ready** with the reason as its tooltip,
+selecting it repeats that reason, and the 2D path keeps working. The
+availability probe runs at page load, so nothing is uploaded before the app
+knows the run cannot start.
+
+### ExMR (refined 3D hands and feet from video)
+
+`exmr (3d)` is the alternative 3D path. [ExMR](https://github.com/twehrbein/ExMR)
+reconstructs SMPL-X motion with separate refinement stages for hands (HandMR)
+and feet (FootMR), so extremities that a whole-body estimate blurs are measured
+from the local image evidence instead. Its smooth, extremity-refined
+`joints_global` frames feed the same `update3D` retargeter as FlowHMR.
+
+ExMR is also a separate environment (Python 3.12 + torch + SAM 3D Body +
+HaMeR). Setup is ExMR's own `docs/INSTALL.md`; the app finds
+`ExMR/.venv/Scripts/python.exe`, or an interpreter written to
+`ExMR/.exmr_python`:
+
+```shell
+set EXMR_PYTHON=C:\path\to\ExMR\.venv\Scripts\python.exe
+set EXMR_DIR=C:\Users\PC\Documents\rtmlib\ExMR      # default: ./ExMR
+set EXMR_CHECKPOINT_DIR=C:\path\to\ExMR\checkpoints # optional
+```
+
+ExMR needs the ExMR weights, SMPL-X, YOLO11m, Sapiens2, SAM 3D Body and HaMeR
+under `ExMR/checkpoints/`; the last two are gated downloads. Runs use ExMR's
+`balanced` mode without rendering, write to the app-owned
+`ExMR/outputs/_rtmlib/<clip>/`, and are rebuilt when the clip is newer than
+that folder. The **3d camera** switch picks `static camera` (default: a fixed
+webcam or tripod) or `moving camera`; the camera motion is a model input, so
+choose the one that matches the footage.
+
+As with FlowHMR, an ExMR bake has **no face track** (ExMR does not estimate
+jaw, eyes or expressions), the person's frame is measured rather than assumed,
+and root translation is not stored in the `.vrma`. When ExMR, its interpreter
+or its files are missing, the picker reads **exmr (3d) - not ready** with the
+reason as its tooltip.
 
 ## Docker
 
@@ -259,6 +411,12 @@ base) and `/opt/musetalk` (torch cu126 + diffusers), which
 | `GET /api/lipsync` | lip-sync job state + whether MuseTalk is installed |
 | `POST /api/lipsync` | `{"audio": "source", "face"?: "videos/clip.mp4"}` → starts a MuseTalk job (only used by Generate VRMA…) |
 | `POST /api/lipsync/cancel` | stop the running MuseTalk job |
+| `GET /api/flowhmr` | FlowHMR job state + whether the checkout/interpreter/checkpoints are ready |
+| `POST /api/flowhmr` | `{"source": "videos/clip.mp4"}` → starts a FlowHMR run (3D joints, no face) |
+| `POST /api/flowhmr/cancel` | stop the running FlowHMR job |
+| `GET /api/exmr` | ExMR job state + whether the checkout/interpreter/checkpoints are ready |
+| `POST /api/exmr` | `{"source": "videos/clip.mp4", "static_cam"?: true}` → starts an ExMR run (refined 3D body/hand/foot joints, no face) |
+| `POST /api/exmr/cancel` | stop the running ExMR job |
 | `POST /api/animation?name=x.vrma` | bakes posted frames into `animations/x.vrma` |
 | `POST /api/vrma?name=x.vrma` | raw `.vrma` upload, served from `animations/` |
 | `POST /api/upload?name=clip.mp4` | raw video body → saved in `videos/` and selected |
@@ -303,13 +461,33 @@ always describe the real person (as seen in the mirrored preview).
   threshold hold their last value, and everything cross-fades to the idle
   animation when tracking stops.
 
+Frames that carry `joints3d` (FlowHMR and ExMR) take a parallel path,
+`update3D`:
+
+* the person's body frame is measured per frame — `up` is hip midpoint →
+  shoulder midpoint, `right` is the person's left → right shoulder — and every
+  joint is projected onto it, so the rig is aimed in a frame that travels with
+  the person instead of one baked into the npz;
+* forward is `up × right`, which is what makes the result a *mirror* rather
+  than a rotation: the person's right hand lands on the avatar's left;
+* each bone is then aimed at its child exactly, with no foreshortening guess —
+  which is the whole point of using a 3D reconstructor;
+* the root follows the pelvis delta, scaled by the ratio between the avatar's
+  torso and the person's so a short person and a tall avatar cover the same
+  ground.
+
 ## Layout
 
 ```
 app/pose_engine.py   capture thread, rtmlib tracking, preview JPEG, pose snapshots
+app/flowhmr_engine.py  FlowHMR subprocess + SMPL-H npz -> joints3d frames
+app/exmr_engine.py     ExMR subprocess + SMPL-X npz -> joints3d frames
 app/server.py        FastAPI: static frontend, MJPEG, websocket, source switching, uploads
 web/src/main.js      three.js scene, VRM + VRMA loading, websocket client, UI
 web/src/mocap.js     2D → VRM retargeting
+web/src/face.js      browser MediaPipe face tracker (GNM webcam puppet port)
+web/src/face-retarget.js  landmarks/blendshapes/head pose → VRM face (pure)
+web/scripts/         vendored MediaPipe asset sync
 videos/              demo live-pose clips (also where uploads land)
 models/              ONNX checkpoints downloaded by scripts/download_models.py
 vrm_models/          avatar (.vrm) and idle animation (.vrma)

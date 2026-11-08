@@ -1,0 +1,17 @@
+{
+    "networkInfoPath": "network_info.json",
+    "networkPath": "network.trt",
+    "emotionDatabasePath": "implicit_emo_db.npz",
+    "modelConfigPath": "model_config.json",
+    "modelDataPath": "model_data.npz",
+    "blendshapePaths": {
+        "skin": {
+            "config": "bs_skin_config.json",
+            "data": "bs_skin.npz"
+        },
+        "tongue": {
+            "config": "bs_tongue_config.json",
+            "data": "bs_tongue.npz"
+        }
+    }
+}

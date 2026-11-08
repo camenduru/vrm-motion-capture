@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { mapBlendshapes } from './face-retarget.js';
 
 /**
  * Retargets COCO-17 keypoints from a mirrored webcam image onto a VRM
@@ -46,12 +47,47 @@ const LEG = {
   right: [KP.leftHip, KP.leftKnee, KP.leftAnkle],
 };
 
+/**
+ * SMPL-H body joints, as FlowHMR writes them (0-21; 22-51 are fingers and the
+ * VRM humanoid rig has no finger bones). SMPL's "left" is the *person's* left,
+ * so - exactly like the 2D path above - the avatar's left bones read the
+ * person's right joints.
+ */
+const SMPL = {
+  pelvis: 0,
+  leftHip: 1, rightHip: 2,
+  spine: 3,
+  leftKnee: 4, rightKnee: 5,
+  spine1: 6,
+  leftAnkle: 7, rightAnkle: 8,
+  spine2: 9,
+  leftToe: 10, rightToe: 11,
+  neck: 12,
+  leftShoulder: 16, rightShoulder: 17,
+  leftElbow: 18, rightElbow: 19,
+  leftWrist: 20, rightWrist: 21,
+  head: 15,
+};
+const SMPL_BODY_JOINTS = 22;
+
+
 const JOINT_CONF = 0.3;
 const TAU_HEAD = 0.08;
 const TAU_ROOT = 0.09;
 const TAU_BLEND = 0.2;
 const TAU_FACE = 0.045;      // expression weight smoothing
 const TAU_FACE_HEAD = 0.07;  // facial head pose smoothing
+const TAU_FACE_GAZE = 0.09;  // iris jitter is fast; gaze needs its own band
+// Radians a full-scale gaze (iris at the eye corner) asks for.
+const GAZE_RANGE = { yaw: 0.5, pitch: 0.32 };
+
+// Every expression this layer can write. Kept in one place so a source that
+// goes away eases all of them to rest instead of leaving the last pose stuck.
+const FACE_ZERO = Object.freeze({
+  aa: 0, ih: 0, ou: 0, ee: 0, oh: 0,
+  blink: 0, blinkLeft: 0, blinkRight: 0,
+  happy: 0, angry: 0, sad: 0, relaxed: 0, surprised: 0,
+});
 
 // One Euro filter bands for the two fast, noisy signals: joint positions
 // (pixels) and limb directions (radians). A fixed time constant has to choose
@@ -67,6 +103,7 @@ const REF_MAX = { rise: 0.01, decay: 0.9995, floor: 0.6, cap: 1.2 };
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const damp = (dt, tau) => 1 - Math.exp(-dt / tau);
+const UP = new THREE.Vector3(0, 1, 0);
 
 /** One Euro blend factor: more smoothing while `speed` is low, less while high. */
 function oneEuro(dt, speed, { minCutoff, beta }) {
@@ -127,6 +164,19 @@ export class MocapRetargeter {
       fresh: false,
     };
     this._faceNames = null;
+    // Audio2Face playback: when set ({blend, eye}) it replaces the webcam
+    // face source until cleared, so the avatar performs a baked track.
+    this.externalFace = null;
+    // Browser face tracker: set by main.js while the in-page MediaPipe tracker
+    // is running. It takes priority over the server's face layer because it
+    // carries gaze and per-eye blink as well as the shared blendshapes, so a
+    // close-up can drive the whole VRM face without the body in frame.
+    this.faceOverride = null;
+    // Eye gaze, in image-normalised units (x right, y down), and the smoothed
+    // value actually applied to the look-at target.
+    this.gaze = { x: 0, y: 0, w: 0 };
+    this.gazeSmoothed = { x: 0, y: 0 };
+    this._lookAtTarget = null;
     this.facing = 1; // +1 person faces the camera, -1 they turned away
     this.dirState = new Map();
     // longest each limb has been seen to project, relative to this avatar's
@@ -152,6 +202,26 @@ export class MocapRetargeter {
     this._before = new THREE.Quaternion();
     this._headTarget = new THREE.Quaternion();
     this._target = new THREE.Vector3();
+    this._eyePos = new THREE.Vector3();
+    this._eyeA = new THREE.Vector3();
+    this._eyeB = new THREE.Vector3();
+    this._eyeC = new THREE.Vector3();
+
+    // 3D (FlowHMR) path: raw joints as they arrive, the same joints in avatar
+    // world space, and the frame axes that map one onto the other
+    this._raw3 = Array.from({ length: SMPL_BODY_JOINTS },
+      () => new THREE.Vector3());
+    this._j3 = Array.from({ length: SMPL_BODY_JOINTS },
+      () => new THREE.Vector3());
+    this._midHip = new THREE.Vector3();
+    this._midSh = new THREE.Vector3();
+    this._up3 = new THREE.Vector3();
+    this._side3 = new THREE.Vector3();
+    this._fwd3 = new THREE.Vector3();
+    this._right3 = new THREE.Vector3();
+    this._d3 = new THREE.Vector3();
+    this._personTorso = 0;
+    this.rootRef = null;
 
     this.enabled = true;
   }
@@ -325,6 +395,14 @@ export class MocapRetargeter {
     if (!this.enabled || !this.b.hips) return;
     dt = clamp(dt, 0.001, 0.1);
 
+    // FlowHMR frames carry exact 3D joints instead of 2D keypoints; they take
+    // the whole body path, including the root translation.
+    if (pose && Array.isArray(pose.joints3d) &&
+        pose.joints3d.length >= SMPL_BODY_JOINTS) {
+      this.update3D(pose, dt);
+      return;
+    }
+
     // the face layer runs even when no body is in frame (a close-up), so it
     // must happen before the body early-returns below
     this.updateFace(pose, dt);
@@ -469,22 +547,41 @@ export class MocapRetargeter {
       ou: pick('ou', 'u'),
       ee: pick('ee', 'e'),
       oh: pick('oh', 'o'),
-      happy: pick('happy'),
+      happy: pick('happy', 'joy'),
       angry: pick('angry'),
-      sad: pick('sad'),
-      relaxed: pick('relaxed'),
+      sad: pick('sad', 'sorrow'),
+      relaxed: pick('relaxed', 'fun'),
       surprised: pick('surprised'),
+      neutral: pick('neutral'),
+      // gaze presets, used only when the avatar has no look-at rig
+      lookUp: pick('lookUp'),
+      lookDown: pick('lookDown'),
+      lookLeft: pick('lookLeft'),
+      lookRight: pick('lookRight'),
     };
     return this._faceNames;
   }
 
   /**
-   * Drive the face from `pose.face` (head quaternion + blendshapes).
-   * Falls back to zero weights when the face is lost, so expressions ease out
-   * instead of sticking.
+   * Drive the face from the best available source.
+   *
+   * Priority: an Audio2Face playback track, then the in-page browser tracker
+   * (`faceOverride`), then the server's face layer. The browser tracker wins
+   * over the server because it carries gaze and per-eye blink; A2F wins over
+   * both because it is a deliberate performance that owns the audio clock.
+   *
+   * A source still drives when the body is lost, which is what makes a
+   * close-up animate the avatar (`face only` in the status pill).
    */
   updateFace(pose, dt) {
-    const face = pose && pose.face ? pose.face : null;
+    const external = this.externalFace;
+    const now = typeof performance !== 'undefined' ? performance.now() : 0;
+    const override = this.faceOverride &&
+      (!this.faceOverride.at || now - this.faceOverride.at < 700)
+      ? this.faceOverride : null;
+    const face = external
+      ? { blend: external.blend || {}, eye: external.eye }
+      : (override || (pose && pose.face ? pose.face : null));
     const hasQ = !!(face && Array.isArray(face.q) && face.q.length === 4);
     const fresh = !!(face && face.blend);
     this.face.fresh = fresh;
@@ -512,61 +609,195 @@ export class MocapRetargeter {
     // --- expressions -----------------------------------------------------
     const em = this.vrm && this.vrm.expressionManager;
     const names = this.faceExpressions();
-    if (!em || !names) return;
 
-    const g = (name) => (fresh ? (face.blend[name] || 0) : 0);
-    const avg = (a, b) => (g(a) + g(b)) * 0.5;
-    // ARKit coefficients idle around 0.02-0.08; the soft floor keeps a resting
-    // face from twitching its brows and mouth
-    const s = (v) => (v <= 0.06 ? 0 : Math.min(1, (v - 0.06) / 0.94));
+    if (em && names) {
+      let targets = FACE_ZERO;
+      if (fresh) {
+        // MuseTalk clips peak around jawOpen 0.25 while a shouted webcam pose
+        // reaches 0.6; normalising against the speaker's own range keeps the
+        // mouth visibly moving instead of pinned shut or permanently wide
+        const get = typeof face.blend.get === 'function'
+          ? (name) => face.blend.get(name) || 0
+          : (name) => face.blend[name] || 0;
+        const jawRaw = get('jawOpen');
+        this.face.mouthRef += (jawRaw - this.face.mouthRef) *
+          (jawRaw > this.face.mouthRef ? 0.35 : 0.008);
+        this.face.mouthRef = clamp(this.face.mouthRef, 0.18, 0.7);
+        targets = mapBlendshapes(face.blend, {
+          mouthRef: this.face.mouthRef,
+        });
+      }
 
-    const jaw = s(g('jawOpen'));
-    // MuseTalk clips peak around jawOpen 0.25 while a shouted webcam pose
-    // reaches 0.6; normalising against the speaker's own range keeps the mouth
-    // visibly moving instead of pinned shut or permanently wide
-    const jawRaw = g('jawOpen');
-    this.face.mouthRef += (jawRaw - this.face.mouthRef) *
-      (jawRaw > this.face.mouthRef ? 0.35 : 0.008);
-    this.face.mouthRef = clamp(this.face.mouthRef, 0.18, 0.7);
-    const open = clamp(
-      (jawRaw - 0.025) / (this.face.mouthRef * 0.75), 0, 1);
-    const smile = s(avg('mouthSmileLeft', 'mouthSmileRight'));
-    const frown = s(avg('mouthFrownLeft', 'mouthFrownRight'));
-    const pucker = s(g('mouthPucker'));
-    const funnel = s(g('mouthFunnel'));
-    const stretch = s(avg('mouthStretchLeft', 'mouthStretchRight'));
-    const browDown = s(avg('browDownLeft', 'browDownRight'));
-    const browIn = s(g('browInnerUp'));
-    const browOut = s(avg('browOuterUpLeft', 'browOuterUpRight'));
-    const eyeWide = s(avg('eyeWideLeft', 'eyeWideRight'));
-    const squint = s(avg('eyeSquintLeft', 'eyeSquintRight'));
+      // Per-eye blink is strictly better than the averaged preset: it keeps a
+      // wink and an asymmetric blink. Writing both `blink` and `blinkLeft/Right`
+      // would double the eyelid close, so one route is chosen per avatar.
+      if (names.blinkLeft && names.blinkRight) targets = { ...targets, blink: 0 };
+      else if (names.blink) {
+        targets = { ...targets, blinkLeft: 0, blinkRight: 0 };
+      }
 
-    const targets = {
-      blink: s(avg('eyeBlinkLeft', 'eyeBlinkRight')),
-      aa: open,
-      ou: pucker,
-      oh: Math.min(1, open * funnel * 1.7 + funnel * 0.2),
-      ee: stretch,
-      // no direct ARKit source for a closed "ih" mouth, and deriving it from
-      // the smile just double-drives `happy`, so it stays unused
-      ih: 0,
-      happy: Math.min(1, smile * (1 - 0.6 * jaw)),
-      angry: Math.min(1, browDown * 0.9 + frown * 0.3),
-      sad: clamp(frown * 0.7 + browIn * 0.35 - browOut * 0.2, 0, 1),
-      surprised: Math.min(1, browIn * 0.75 + eyeWide * 0.55),
-      relaxed: Math.min(1, squint * 0.3),
-    };
-
-    const a = damp(dt, TAU_FACE);
-    for (const key of Object.keys(targets)) {
-      const name = names[key];
-      if (!name) continue;
-      const want = targets[key];
-      const cur = this.face.weights[key] || 0;
-      const next = cur + (want - cur) * a;
-      this.face.weights[key] = next;
-      if (next > 0.0005 || cur > 0.0005) em.setValue(name, next);
+      const a = damp(dt, TAU_FACE);
+      for (const key of Object.keys(FACE_ZERO)) {
+        const name = names[key];
+        if (!name) continue;
+        const want = targets[key] || 0;
+        const cur = this.face.weights[key] || 0;
+        const next = cur + (want - cur) * a;
+        this.face.weights[key] = next;
+        if (next > 0.0005 || cur > 0.0005) em.setValue(name, next);
+      }
     }
+
+    // --- gaze ------------------------------------------------------------
+    if (external) this.applyExternalEyes(external.eye);
+    else this.applyGaze(face && face.gaze ? face.gaze : null, dt);
+  }
+
+  /** Creates the look-at target once; the previous target is restored on release. */
+  ensureLookAtTarget(lookAt) {
+    if (this._lookAtTarget) return;
+    this._lookAtTarget = new THREE.Object3D();
+    this._lookAtTarget.name = 'mocap-gaze-target';
+    this.vrm.scene.add(this._lookAtTarget);
+    this._lookAtPrev = lookAt.target || null;
+    lookAt.target = this._lookAtTarget;
+  }
+
+  /** Removes the gaze target and zeroes the fallback eye expressions. */
+  releaseLookAt(lookAt) {
+    if (lookAt && this._lookAtTarget) {
+      lookAt.target = this._lookAtPrev || null;
+      this.vrm.scene.remove(this._lookAtTarget);
+      this._lookAtTarget = null;
+    }
+    const em = this.vrm && this.vrm.expressionManager;
+    if (em && this._faceNames) {
+      for (const key of ['lookUp', 'lookDown', 'lookLeft', 'lookRight']) {
+        if (this._faceNames[key]) em.setValue(this._faceNames[key], 0);
+      }
+    }
+  }
+
+  /**
+   * Eye gaze from the browser tracker, in image-normalised units
+   * (x positive = towards the image's right, y positive = down).
+   *
+   * With a look-at rig the target sits a capped angle off the line from the
+   * head to the camera, so the avatar looks out of the screen where the
+   * person's irises are looking. Without one, the VRM look presets take over.
+   */
+  applyGaze(gaze, dt) {
+    const head = this.b.head;
+    if (!head) return;
+    const has = !!(gaze && Number.isFinite(gaze.x) && Number.isFinite(gaze.y));
+    const a = damp(dt, TAU_FACE_GAZE);
+    this.gazeSmoothed.x += ((has ? clamp(gaze.x, -1.5, 1.5) : 0) -
+      this.gazeSmoothed.x) * a;
+    this.gazeSmoothed.y += ((has ? clamp(gaze.y, -1.5, 1.5) : 0) -
+      this.gazeSmoothed.y) * a;
+    this.gaze.w += ((has ? 1 : 0) - this.gaze.w) * damp(dt, TAU_FACE_HEAD);
+
+    const lookAt = this.vrm && this.vrm.lookAt;
+    if (lookAt) {
+      if (this.gaze.w > 0.001) {
+        this.ensureLookAtTarget(lookAt);
+        head.getWorldPosition(this._eyePos);
+        const dir = this._eyeA.copy(this.camera
+          ? this.camera.position : this._eyeB.set(0, 1.4, 3)
+        ).sub(this._eyePos).normalize();
+        // camera right and up, independent of the avatar's own orientation
+        const right = this._eyeB.crossVectors(UP, dir).normalize();
+        const up = this._eyeC.crossVectors(dir, right).normalize();
+        const yaw = Math.sin(this.gazeSmoothed.x * GAZE_RANGE.yaw) * 1.2;
+        const pitch = Math.sin(this.gazeSmoothed.y * GAZE_RANGE.pitch) * 1.2;
+        this._lookAtTarget.position.copy(this._eyePos)
+          .addScaledVector(dir, 1.2)
+          .addScaledVector(right, yaw)
+          .addScaledVector(up, -pitch);
+      } else if (!has) {
+        this.releaseLookAt(lookAt);
+      }
+      return;
+    }
+    this.applyGazeExpressions(this.gazeSmoothed.x, this.gazeSmoothed.y);
+  }
+
+  /** Writes gaze into the VRM look presets, for avatars with no look-at rig. */
+  applyGazeExpressions(x, y) {
+    const em = this.vrm && this.vrm.expressionManager;
+    const names = this.faceExpressions();
+    if (!em || !names) return;
+    const side = clamp(x, -1, 1);
+    const up = clamp(-y, -1, 1);
+    if (names.lookLeft || names.lookRight || names.lookUp || names.lookDown) {
+      if (names.lookLeft) em.setValue(names.lookLeft, Math.max(0, side));
+      if (names.lookRight) em.setValue(names.lookRight, Math.max(0, -side));
+      if (names.lookUp) em.setValue(names.lookUp, Math.max(0, up));
+      if (names.lookDown) em.setValue(names.lookDown, Math.max(0, -up));
+      return;
+    }
+    // VRM 0.x per-eye names; "out" on the left eye is the character's left,
+    // which is the screen's right, hence the same sign as `side`.
+    em.setValue('eyeLookUpLeft', Math.max(0, up));
+    em.setValue('eyeLookUpRight', Math.max(0, up));
+    em.setValue('eyeLookDownLeft', Math.max(0, -up));
+    em.setValue('eyeLookDownRight', Math.max(0, -up));
+    em.setValue('eyeLookOutLeft', Math.max(0, side));
+    em.setValue('eyeLookInRight', Math.max(0, side));
+    em.setValue('eyeLookInLeft', Math.max(0, -side));
+    em.setValue('eyeLookOutRight', Math.max(0, -side));
+  }
+
+  /**
+   * Gaze for the Audio2Face track. The SDK eye output is (x = pitch,
+   * y = yaw) per eye in degrees, so the lookAt target sits a small angle off
+   * the straight line to the camera. Falls back to the VRM look presets when
+   * this avatar has no lookAt rig.
+   */
+  applyExternalEyes(eye) {
+    const head = this.b.head;
+    if (!head || !Array.isArray(eye) || eye.length < 4) return;
+    const yaw = (eye[1] + eye[3]) * 0.5 * Math.PI / 180;
+    const pitch = (eye[0] + eye[2]) * 0.5 * Math.PI / 180;
+
+    const lookAt = this.vrm && this.vrm.lookAt;
+    if (lookAt) {
+      this.ensureLookAtTarget(lookAt);
+      head.getWorldPosition(this._eyePos);
+      const dir = this._eyeA.copy(this.camera
+        ? this.camera.position : this._eyeB.set(0, 1.4, 3)
+      ).sub(this._eyePos).normalize();
+      const right = this._eyeB.crossVectors(UP, dir).normalize();
+      const up = this._eyeC.crossVectors(dir, right).normalize();
+      dir.addScaledVector(right, Math.sin(yaw))
+        .addScaledVector(up, Math.sin(pitch)).normalize();
+      this._lookAtTarget.position.copy(this._eyePos)
+        .addScaledVector(dir, 1.2);
+      return;
+    }
+    // no lookAt rig: approximate with the eye look expressions
+    const range = 0.3; // radians that maps to a full expression weight
+    this.applyGazeExpressions(yaw / range, -pitch / range);
+  }
+
+  /** Called by the browser tracker on every detected frame. */
+  setFaceOverride(frame) {
+    this.faceOverride = frame;
+  }
+
+  /** Stop the browser face source and hand the eyes back to the avatar. */
+  clearFaceOverride() {
+    this.faceOverride = null;
+    this.gaze.w = 0;
+    this.gazeSmoothed.x = 0;
+    this.gazeSmoothed.y = 0;
+    this.releaseLookAt(this.vrm && this.vrm.lookAt);
+  }
+
+  /** Stop the Audio2Face face source and restore the avatar's own gaze. */
+  clearExternalFace() {
+    this.externalFace = null;
+    this.releaseLookAt(this.vrm && this.vrm.lookAt);
   }
 
   updateHead(dt, weight, k) {
@@ -625,6 +856,130 @@ export class MocapRetargeter {
     head.quaternion.slerp(this._headTarget, weight);
   }
 
+  /* ------------------------------------------------------- 3D joints ---- */
+  /**
+   * Put the person's own body frame onto the avatar's.
+   *
+   * `up` is hip midpoint -> shoulder midpoint, `right` is the person's left
+   * shoulder -> right shoulder. Mapping right onto +X and up onto +Y puts the
+   * person's right hand on the right of the screen, which is the avatar's left
+   * - the same mirror the 2D path gets by swapping the keypoint sides. Taking
+   * the frame from the body instead of assuming an axis convention for the npz
+   * means a clip that turns around turns the avatar with it.
+   */
+  basis3D(joints, dt) {
+    const raw = this._raw3;
+    for (let i = 0; i < SMPL_BODY_JOINTS; i++) {
+      const p = joints[i];
+      if (!Array.isArray(p) || p.length < 3) return false;
+      if (!Number.isFinite(p[0]) || !Number.isFinite(p[1]) ||
+          !Number.isFinite(p[2])) return false;
+      raw[i].set(p[0], p[1], p[2]);
+    }
+
+    this._midHip.copy(raw[SMPL.leftHip]).add(raw[SMPL.rightHip])
+      .multiplyScalar(0.5);
+    this._midSh.copy(raw[SMPL.leftShoulder]).add(raw[SMPL.rightShoulder])
+      .multiplyScalar(0.5);
+
+    const up = this._up3.copy(this._midSh).sub(this._midHip);
+    const side = this._side3.copy(raw[SMPL.rightShoulder])
+      .sub(raw[SMPL.leftShoulder]);
+    const torso = up.length();
+    if (torso < 1e-3 || side.lengthSq() < 1e-8) return false;
+    up.normalize();
+    side.normalize();
+
+    // smooth the frame axes, not the joints: the torso is the steadiest part
+    // of the body, and a basis that twitches would wobble every bone at once
+    const upS = this.smoothDir('basisUp', up, dt);
+    const sideS = this.smoothDir('basisSide', side, dt);
+
+    // forward is up x right, not right x up: a person facing the camera has
+    // their right at -X while their forward is +Z, so (right, up, forward) is
+    // left-handed - the mirror this app wants, not a rotation
+    const fwd = this._fwd3.crossVectors(upS, sideS);
+    if (fwd.lengthSq() < 1e-8) return false;
+    fwd.normalize();
+    // re-derive right from forward x up so the three axes stay orthonormal
+    const right = this._right3.crossVectors(fwd, upS).normalize();
+
+    for (let i = 0; i < SMPL_BODY_JOINTS; i++) {
+      const p = raw[i];
+      this._j3[i].set(p.dot(right), p.dot(upS), p.dot(fwd));
+    }
+    this._personTorso = torso;
+    return true;
+  }
+
+  /**
+   * Drive the rig from SMPL-H 3D joints (FlowHMR) instead of 2D keypoints.
+   *
+   * The 2D path has to invent depth from limb foreshortening; here every bone
+   * direction is measured, so each bone is aimed at its child exactly. Only the
+   * root translation is still scaled against the avatar, by the torso ratio, so
+   * a short person and a tall avatar cover the same ground.
+   */
+  update3D(pose, dt) {
+    // these frames carry no face: ease whatever the previous clip left on the
+    // face back to rest so the baked VRMA does not inherit it
+    this.updateFace(null, dt);
+
+    this.blend += (1 - this.blend) * damp(dt, TAU_BLEND);
+    const weight = this.blend;
+    if (weight <= 0.002) return;
+
+    this.vrm.scene.updateMatrixWorld(true);
+    if (!this.basis3D(pose.joints3d, dt)) return;
+
+    const j = this._j3;
+    const aimJ = (bone, child, a, b) => {
+      if (!this.b[bone] || !this.b[child]) return;
+      const d = this._d3.copy(j[b]).sub(j[a]);
+      if (d.lengthSq() < 1e-10) return;
+      this.aimBone(bone, child, d.normalize(), weight);
+    };
+
+    // --- spine chain: each segment aims at the next joint ----------------
+    aimJ('hips', 'spine', SMPL.pelvis, SMPL.spine);
+    aimJ('spine', 'chest', SMPL.spine, SMPL.spine1);
+    if (this.b.upperChest) {
+      aimJ('chest', 'upperChest', SMPL.spine1, SMPL.spine2);
+      aimJ('upperChest', 'neck', SMPL.spine2, SMPL.neck);
+    } else {
+      aimJ('chest', 'neck', SMPL.spine2, SMPL.neck);
+    }
+    aimJ('neck', 'head', SMPL.neck, SMPL.head);
+
+    // --- limbs: the avatar's left reads the person's right ---------------
+    for (const side of ['left', 'right']) {
+      const p = side === 'left' ? 'right' : 'left';
+      aimJ(`${side}UpperArm`, `${side}LowerArm`,
+        SMPL[`${p}Shoulder`], SMPL[`${p}Elbow`]);
+      aimJ(`${side}LowerArm`, `${side}Hand`,
+        SMPL[`${p}Elbow`], SMPL[`${p}Wrist`]);
+
+      aimJ(`${side}UpperLeg`, `${side}LowerLeg`,
+        SMPL[`${p}Hip`], SMPL[`${p}Knee`]);
+      aimJ(`${side}LowerLeg`, `${side}Foot`,
+        SMPL[`${p}Knee`], SMPL[`${p}Ankle`]);
+      aimJ(`${side}Foot`, `${side}Toes`,
+        SMPL[`${p}Ankle`], SMPL[`${p}Toe`]);
+    }
+
+    // --- root translation -------------------------------------------------
+    const pelvis = j[SMPL.pelvis];
+    if (!this.rootRef) this.rootRef = pelvis.clone();
+    const scale = clamp(this.rest.torso / Math.max(0.05, this._personTorso),
+      0.4, 2.5);
+    this._target.set(
+      clamp((pelvis.x - this.rootRef.x) * scale, -1.6, 1.6) * weight,
+      clamp((pelvis.y - this.rootRef.y) * scale, -0.6, 0.6) * weight,
+      clamp((pelvis.z - this.rootRef.z) * scale, -1.6, 1.6) * weight,
+    );
+    this.root.position.lerp(this._target, damp(dt, TAU_ROOT));
+  }
+
   reset() {
     this.blend = 0;
     this.hasJoint.fill(0);
@@ -639,6 +994,12 @@ export class MocapRetargeter {
     this.face.headW = 0;
     this.face.mouthRef = 0.25;
     this.face.weights = Object.create(null);
+    this.faceOverride = null;
+    this.gaze.w = 0;
+    this.gazeSmoothed.x = 0;
+    this.gazeSmoothed.y = 0;
+    this.releaseLookAt(this.vrm && this.vrm.lookAt);
     this.root.position.set(0, 0, 0);
+    this.rootRef = null;
   }
 }

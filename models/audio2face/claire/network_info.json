@@ -1,0 +1,46 @@
+{
+    "id": {
+        "type": "regression",
+        "actor": "claire",
+        "version": "2.3",
+        "output":"geometry"
+    },
+    "params": {
+        "implicit_emotion_len": 16,
+        "explicit_emotions": [
+            "amazement",
+            "anger",
+            "cheekiness",
+            "disgust",
+            "fear",
+            "grief",
+            "joy",
+            "outofbreath",
+            "pain",
+            "sadness"
+        ],
+        "default_emotion": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+        ],
+        "num_shapes_skin": 140,
+        "num_shapes_tongue": 10,
+        "num_verts_skin": 61520,
+        "num_verts_tongue": 5602,
+        "result_jaw_size": 15,
+        "result_eyes_size": 4
+    },
+    "audio_params": {
+        "buffer_len": 8320,
+        "buffer_ofs": 4160,
+        "samplerate": 16000
+    }
+}

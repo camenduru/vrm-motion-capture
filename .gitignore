@@ -30,6 +30,10 @@ npm-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# vendored MediaPipe runtime + the face model (npm run sync-face-assets)
+web/public/mediapipe/
+web/public/face_landmarker.task
+
 # --- Pose models (scripts/download_models.py, ~200 MB) ---------------------
 models/*.onnx
 models/*.ort
@@ -40,9 +44,17 @@ models/*.pth
 rtmlib/
 RTMPose/
 MuseTalk/
+flowhmr/
+PEAR/
+GEM-X/
+ExMR/
 
 # --- Runtime output --------------------------------------------------------
 *.log
+*.npz
+*.wav
+*.vrma
+*.onnx
 
 # --- Local tool state ------------------------------------------------------
 .freebuff/
@@ -58,3 +70,4 @@ desktop.ini
 # Note: videos/ ships the demo live-pose clips referenced by the README.
 #       Clips added through the UI land there too — delete the ones you do not
 #       want to commit before staging.
+.cache/

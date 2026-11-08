@@ -38,6 +38,7 @@
       <div class="stats">
         <div class="stat"><span class="k">render</span><span class="v" id="stat-render">—</span></div>
         <div class="stat"><span class="k">pose</span><span class="v" id="stat-pose">—</span></div>
+        <div class="stat"><span class="k">face</span><span class="v" id="stat-face">—</span></div>
         <div class="stat"><span class="k">model</span><span class="v" id="stat-model">—</span></div>
       </div>
 
@@ -61,6 +62,34 @@
             <option value="musetalk">musetalk (offline)</option>
           </select>
         </label>
+        <label class="picker">
+          <span>generate with</span>
+          <select id="generate-with" aria-label="Generation backend">
+            <option value="rtmpose">rtmpose (2d)</option>
+            <option value="flowhmr">flowhmr (3d)</option>
+            <option value="exmr">exmr (3d)</option>
+          </select>
+        </label>
+        <!-- FlowHMR only: VGGT-Omega runs per frame unless told otherwise,
+             which is what makes long clips slow and memory hungry (interval 1
+             peaks near 30 GB, so 24 GB cards start at every 10th frame) -->
+        <label class="picker hidden" id="flowhmr-interval-picker">
+          <span>3d camera detail</span>
+          <select id="flowhmr-interval" aria-label="Camera estimation interval">
+            <option value="10">every 10th frame</option>
+            <option value="3">every 3rd frame</option>
+            <option value="1">every frame (needs ~30 GB)</option>
+          </select>
+        </label>
+        <!-- ExMR only: it uses the camera motion during inference; a fixed
+             camera is both faster and the better world trajectory for it -->
+        <label class="picker hidden" id="exmr-camera-picker">
+          <span>3d camera</span>
+          <select id="exmr-camera" aria-label="ExMR camera motion">
+            <option value="static">static camera</option>
+            <option value="moving">moving camera</option>
+          </select>
+        </label>
         <input id="file-input" type="file" hidden
                accept="video/*,.mp4,.webm,.mov,.mkv,.m4v,.avi" />
         <button id="btn-upload" type="button">Add video…</button>
@@ -68,6 +97,14 @@
         <button id="btn-load-vrma" type="button">Load VRMA…</button>
         <input id="vrma-input" type="file" hidden accept=".vrma,.glb" />
         <button id="btn-realtime" type="button">Start realtime drive</button>
+        <button id="btn-face-track" type="button">Face tracker</button>
+        <!-- Audio2Face-3D: pick audio (or record from the mic), the server
+             bakes a 60 fps ARKit blendshape track, then the avatar performs it -->
+        <button id="btn-a2f" type="button">Audio2Face…</button>
+        <input id="a2f-input" type="file" hidden
+               accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.flac,.opus,.webm" />
+        <button id="btn-a2f-mic" type="button">Record audio</button>
+        <button id="btn-a2f-play" type="button" class="hidden">Play face</button>
         <button id="btn-reset" type="button">Reset view</button>
         <button id="btn-sound" type="button" class="active">Sound</button>
         <button id="btn-fullscreen" type="button">Fullscreen</button>
@@ -89,6 +126,10 @@
       <!-- the pose stream is silent MJPEG; the clip's own audio track is
            played here and nudged to follow the frame timestamp -->
       <audio id="source-audio" loop preload="auto"></audio>
+
+      <!-- Audio2Face playback clock: the baked face track is sampled against
+           this element's currentTime, so lips and audio stay in sync -->
+      <audio id="a2f-audio" preload="auto"></audio>
 
       <div class="toast" id="toast"></div>
 

@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -28,7 +29,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .pose_engine import COCO_KEYPOINTS, VIDEO_EXT, PoseEngine
-from . import lipsync, offline, vrma
+from . import (audio2face_engine, exmr_engine, flowhmr_engine, lipsync,
+               offline, vrma)
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIST = ROOT / 'web' / 'dist'
@@ -38,6 +40,10 @@ AUDIO_DIR = ROOT / 'audio'
 ANIM_DIR = ROOT / 'animations'
 UPLOAD_LIMIT = 512 * 1024 * 1024
 AUDIO_EXT = {'.wav', '.mp3', '.m4a', '.aac', '.ogg', '.flac', '.opus'}
+
+# Windows' mimetypes database does not always know .wasm; MediaPipe's runtime
+# is compiled to WebAssembly and browsers refuse it without the right type.
+mimetypes.add_type('application/wasm', '.wasm')
 
 engine: PoseEngine | None = None
 _boundary = 'frame'
@@ -58,6 +64,9 @@ def create_app(pose_engine: PoseEngine) -> FastAPI:
     app = FastAPI(title='VRM Motion Capture', lifespan=lifespan)
     lip_sync = lipsync.LipSyncJob()
     bake = offline.BakeJob()
+    flowhmr_job = flowhmr_engine.FlowHMRJob()
+    exmr_job = exmr_engine.ExMRJob()
+    a2f_job = audio2face_engine.Audio2FaceJob()
 
     @app.middleware('http')
     async def revalidate_avatar_assets(request, call_next):
@@ -288,6 +297,125 @@ def create_app(pose_engine: PoseEngine) -> FastAPI:
     async def bake_cancel():
         return bake.cancel()
 
+    # ------------------------------------------- FlowHMR (3D video) bake
+    @app.post('/api/flowhmr')
+    async def flowhmr_start(payload: dict):
+        """Reconstruct 3D motion from a video with FlowHMR, off the live path."""
+        ref = str(payload.get('source', '')).strip()
+        path = (ROOT / ref).resolve()
+        if not ref or ROOT not in path.parents or not path.exists():
+            return JSONResponse({'error': 'video not found'}, status_code=400)
+        if path.suffix.lower() not in VIDEO_EXT:
+            return JSONResponse({'error': 'not a video file'},
+                                status_code=400)
+        try:
+            return flowhmr_job.start(
+                path,
+                postprocess=bool(payload.get('postprocess', True)),
+                vggt_interval=int(payload.get('vggt_interval', 1) or 1))
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({'error': str(exc)}, status_code=409)
+
+    @app.get('/api/flowhmr')
+    async def flowhmr_state(full: bool = False):
+        data = dict(flowhmr_job.status())
+        data['available'] = flowhmr_engine.availability()
+        if full and data['state'] == 'done':
+            data.update(flowhmr_job.result() or {})
+        return data
+
+    @app.post('/api/flowhmr/cancel')
+    async def flowhmr_cancel():
+        return flowhmr_job.cancel()
+
+    # ------------------------------------------------ ExMR (3D video) bake
+    @app.post('/api/exmr')
+    async def exmr_start(payload: dict):
+        """Reconstruct 3D body/hand/foot motion from a video with ExMR."""
+        ref = str(payload.get('source', '')).strip()
+        path = (ROOT / ref).resolve()
+        if not ref or ROOT not in path.parents or not path.exists():
+            return JSONResponse({'error': 'video not found'}, status_code=400)
+        if path.suffix.lower() not in VIDEO_EXT:
+            return JSONResponse({'error': 'not a video file'},
+                                status_code=400)
+        try:
+            return exmr_job.start(
+                path, static_cam=bool(payload.get('static_cam', True)))
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({'error': str(exc)}, status_code=409)
+
+    @app.get('/api/exmr')
+    async def exmr_state(full: bool = False):
+        data = dict(exmr_job.status())
+        data['available'] = exmr_engine.availability()
+        if full and data['state'] == 'done':
+            data.update(exmr_job.result() or {})
+        return data
+
+    @app.post('/api/exmr/cancel')
+    async def exmr_cancel():
+        return exmr_job.cancel()
+
+    # ------------------------------------------------- Audio2Face-3D bake
+    @app.get('/api/a2f/status')
+    async def a2f_status():
+        return audio2face_engine.availability()
+
+    @app.post('/api/a2f')
+    async def a2f_start(payload: dict):
+        """Generate a facial animation track from an audio file."""
+        audio_ref = str(payload.get('audio', '')).strip()
+        model = str(payload.get('model', '')).strip() or None
+
+        if a2f_job.busy():
+            return JSONResponse(
+                {'error': 'an Audio2Face job is already running'},
+                status_code=409)
+
+        if audio_ref == 'source':
+            source_path = pose_engine.resolve_source(pose_engine.source)
+            if source_path is None or source_path.suffix.lower() in \
+                    {'.png', '.jpg', '.jpeg', '.bmp', '.webp'}:
+                return JSONResponse(
+                    {'error': 'the pose source has no audio track - use a '
+                              'video, or upload an audio file'},
+                    status_code=400)
+            try:
+                audio = lipsync.extract_source_audio(source_path)
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse({'error': str(exc)}, status_code=400)
+        else:
+            audio = (ROOT / audio_ref).resolve()
+            if ROOT not in audio.parents or not audio.exists():
+                return JSONResponse({'error': 'audio file not found'},
+                                    status_code=400)
+
+        try:
+            return a2f_job.start(audio, model)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({'error': str(exc)}, status_code=400)
+
+    @app.get('/api/a2f')
+    async def a2f_state(full: bool = False):
+        data = dict(a2f_job.status())
+        if full and data['state'] == 'done':
+            track = a2f_job.result() or {}
+            # persist the track so it can be replayed or reloaded later
+            stem = re.sub(r'[^A-Za-z0-9._-]+', '_',
+                          Path(track.get('source_audio', 'a2f')).stem)
+            name = f'{stem}_a2f.json'
+            ANIM_DIR.mkdir(exist_ok=True)
+            (ANIM_DIR / name).write_text(json.dumps(track))
+            track = dict(track)
+            track['animation_url'] = f'/animations/{name}'
+            data.update(track)
+        return data
+
+    @app.post('/api/a2f/cancel')
+    async def a2f_cancel():
+        return a2f_job.cancel()
+
     @app.post('/api/vrma')
     async def upload_vrma(name: str, request: Request):
         """Store a .vrma the user picked (already a VRM Animation)."""
@@ -442,6 +570,8 @@ def create_app(pose_engine: PoseEngine) -> FastAPI:
 
     app.mount('/vrm', StaticFiles(directory=VRM_DIR), name='vrm')
     app.mount('/videos', StaticFiles(directory=VIDEOS_DIR), name='videos')
+    AUDIO_DIR.mkdir(exist_ok=True)
+    app.mount('/audio', StaticFiles(directory=AUDIO_DIR), name='audio')
     ANIM_DIR.mkdir(exist_ok=True)
     app.mount('/animations', StaticFiles(directory=ANIM_DIR), name='animations')
 

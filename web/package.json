@@ -6,9 +6,14 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --test test/*.test.mjs",
+    "sync-face-assets": "node scripts/sync-face-assets.mjs",
+    "predev": "node scripts/sync-face-assets.mjs",
+    "prebuild": "node scripts/sync-face-assets.mjs"
   },
   "dependencies": {
+    "@mediapipe/tasks-vision": "^1.2.2",
     "@pixiv/three-vrm": "^3.5.5",
     "@pixiv/three-vrm-animation": "^3.5.5",
     "three": "^0.186.1"
